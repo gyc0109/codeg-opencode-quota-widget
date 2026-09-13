@@ -1,0 +1,15 @@
+[Unit]
+Description=opencode-go quota management API for codeg-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/codeg.env
+Environment=OPENCODE_QUOTA_API_PORT=3081
+ExecStart=/usr/local/bin/codeg-opencode-quota-api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

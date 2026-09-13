@@ -1,0 +1,14 @@
+[Unit]
+Description=opencode-go quota updater for codeg-server
+After=network-online.target codeg.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/codeg.env
+ExecStart=/usr/local/bin/codeg-opencode-quota-updater
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
