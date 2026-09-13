@@ -1,44 +1,65 @@
 #!/usr/bin/env python3
-"""多账号版 opencode-go 额度抓取：循环拉每个账号的 /usage，合并写入 opencode-quota.json"""
-import json, os, re, sys, time, urllib.request, urllib.error, pathlib
+"""多账号版 opencode-go 额度抓取：循环拉每个账号的 /usage，合并写入 opencode-quota.json
 
-ACCOUNTS_FILE = "/root/.config/opencode/quota-accounts.json"
-FALLBACK_CONFIG = "/root/.config/opencode/opencode.jsonc"
-OUT = os.environ.get("CODEG_STATIC_DIR", "/usr/local/share/codeg/web") + "/opencode-quota.json"
-HISTORY = os.environ.get("CODEG_STATIC_DIR", "/usr/local/share/codeg/web") + "/opencode-quota-history.jsonl"
+输出位置：data 目录（api 读取）+ web 静态根（存在时镜像，供前端同源 fetch）。
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+import pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _codeg_quota_common as common  # noqa: E402
+
 HISTORY_KEEP = 1500  # 约 25 小时（60s 间隔）
 URL = "https://opencode.ai/zen/go/v1/usage"
 INTERVAL = int(os.environ.get("OPENCODE_QUOTA_INTERVAL", "60"))
 
-def load_accounts():
-    try:
-        d = json.loads(pathlib.Path(ACCOUNTS_FILE).read_text())
-        acc = [(x.get("name", f"账号{i+1}"), x.get("apiKey", "")) for i, x in enumerate(d) if x.get("apiKey")]
-        if acc: return acc
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"opencode-quota: accounts file error: {e}", file=sys.stderr)
-    # 回退：单 key
-    try:
-        t = pathlib.Path(FALLBACK_CONFIG).read_text()
-        m = re.search(r'"apiKey"\s*:\s*"([^"]+)"', t)
-        if m: return [("主号", m.group(1))]
-    except Exception as e:
-        print(f"opencode-quota: fallback config error: {e}", file=sys.stderr)
-    return []
 
 def fetch(key):
     req = urllib.request.Request(URL, headers={
-        "Authorization": f"Bearer {key}",
+        "Authorization": "Bearer " + key,
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0",
     })
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def append_history(accounts):
+    """用量快照 append 到 jsonl，供前端画 24h 曲线；超长截尾。"""
+    line = {"t": int(time.time()), "a": [
+        {"n": a.get("name", "?"),
+         "r": (a.get("usage") or {}).get("rolling", {}).get("percent"),
+         "w": (a.get("usage") or {}).get("weekly", {}).get("percent"),
+         "m": (a.get("usage") or {}).get("monthly", {}).get("percent")}
+        for a in accounts]}
+    for path, _ in common.write_targets("opencode-quota-history.jsonl"):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > HISTORY_KEEP + 200:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-HISTORY_KEEP:])
+        except OSError as e:
+            print("opencode-quota: history write failed (%s): %s" % (path, e), file=sys.stderr)
+
+
 def once():
-    acc = load_accounts()
+    acc = common.load_accounts()
     if not acc:
         print("opencode-quota: no accounts", file=sys.stderr)
         return False
@@ -53,42 +74,28 @@ def once():
         except Exception as e:
             out["accounts"].append({"name": name, "error": str(e)[:120]})
             fail += 1
-            print(f"opencode-quota: [{name}] failed: {e}", file=sys.stderr)
+            print("opencode-quota: [%s] failed: %s" % (name, e), file=sys.stderr)
     out["_fetchedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # 兼容：单账号时同时保留顶层 usage（老前端可用）
     if len(out["accounts"]) == 1 and "usage" in out["accounts"][0]:
         out["usage"] = out["accounts"][0]["usage"]
-    tmp = OUT + ".tmp"
-    pathlib.Path(tmp).write_text(json.dumps(out, ensure_ascii=False))
-    os.replace(tmp, OUT)
+    payload = json.dumps(out, ensure_ascii=False)
+    for path, _ in common.write_targets("opencode-quota.json"):
+        try:
+            atomic_write(path, payload)
+        except OSError as e:
+            print("opencode-quota: write failed (%s): %s" % (path, e), file=sys.stderr)
     append_history(out["accounts"])
-    print(f"opencode-quota: ok={ok} fail={fail} accounts={len(acc)}", flush=True)
+    print("opencode-quota: ok=%d fail=%d accounts=%d" % (ok, fail, len(acc)), flush=True)
     return fail == 0 or ok > 0
 
-def append_history(accounts):
-    """用量快照 append 到 jsonl，供前端画 24h 曲线；超长截尾。"""
-    try:
-        line = {"t": int(time.time()), "a": [
-            {"n": a.get("name", "?"),
-             "r": (a.get("usage") or {}).get("rolling", {}).get("percent"),
-             "w": (a.get("usage") or {}).get("weekly", {}).get("percent"),
-             "m": (a.get("usage") or {}).get("monthly", {}).get("percent")}
-            for a in accounts]}
-        with open(HISTORY, "a", encoding="utf-8") as f:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
-        # 截尾（顺手做，不必每轮精确）
-        with open(HISTORY, encoding="utf-8") as f:
-            lines = f.readlines()
-        if len(lines) > HISTORY_KEEP + 200:
-            with open(HISTORY, "w", encoding="utf-8") as f:
-                f.writelines(lines[-HISTORY_KEEP:])
-    except OSError as e:
-        print(f"opencode-quota: history write failed: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     if "--once" in sys.argv:
         sys.exit(0 if once() else 1)
     while True:
-        try: once()
-        except Exception as e: print(f"opencode-quota: loop error: {e}", file=sys.stderr)
+        try:
+            once()
+        except Exception as e:
+            print("opencode-quota: loop error: %s" % e, file=sys.stderr)
         time.sleep(INTERVAL)

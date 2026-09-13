@@ -1,5 +1,11 @@
 (function(){
-  var JSON_URL="/opencode-quota.json", HIST_URL="/opencode-quota-history.jsonl", API_URL="https://opencode.ai/zen/go/v1/usage", REFRESH_MS=60000;
+  // 端点解析：http(s) 页面（Linux 服务端 / 浏览器模式）走同源相对路径；
+  // 桌面壳（tauri:// 等自定义协议）无法同源取静态文件，统一走本机 sidecar。
+  var IS_WEB=/^https?:$/.test((location.protocol||"").toLowerCase());
+  var API_ORIGIN=IS_WEB?(location.protocol+"//"+location.hostname+":3081"):"http://127.0.0.1:3081";
+  var JSON_URL=IS_WEB?"/opencode-quota.json":API_ORIGIN+"/quota.json";
+  var HIST_URL=IS_WEB?"/opencode-quota-history.jsonl":API_ORIGIN+"/quota-history.jsonl";
+  var API_URL="https://opencode.ai/zen/go/v1/usage", REFRESH_MS=60000;
   var LS_ACCT="opencode-quota-account", LS_MODE="opencode-quota-mode", LS_FOLD="opencode-quota-folded"; // mode: left|used
   var ALERT_PCT=80; // 5h 已用超此值 → 红色脉冲 + 浏览器通知
 
@@ -98,7 +104,7 @@
   }
 
   var quotaEl=null, popup=null, cache=null, histCache=null, timerStarted=false;
-  function apiBase(){ return location.protocol+"//"+location.hostname+":3081"; }
+  function apiBase(){ return API_ORIGIN; }
   function apiToken(){ return localStorage.getItem("codeg_token")||""; }
   async function apiCall(method, path, body){
     var opt={ method:method, headers:{ "X-Codeg-Token": apiToken(), "Content-Type":"application/json" } };

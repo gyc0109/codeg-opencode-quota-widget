@@ -1,16 +1,25 @@
 # codeg-opencode-quota-widget
 
-在 **codeg-server** 网页里常驻显示 **opencode-go 订阅剩余额度**（5小时滚动 / 每周 / 每月），支持多账号、已用/剩余切换、中英自适应。
+在 codeg 界面里常驻显示 **opencode-go 订阅剩余额度**（5小时滚动 / 每周 / 每月），支持多账号、已用/剩余切换、中英自适应。
 
 ![license](https://img.shields.io/badge/license-MIT-green)
 
+支持平台：
+
+| 平台 | 形态 | 安装方式 |
+|---|---|---|
+| Linux | codeg-server（systemd） | `sudo ./install.sh` |
+| macOS | 浏览器模式：本机 :3080 提供 codeg web UI | `./install.sh --browser` |
+| macOS | 桌面版 codeg.app 窗口内注入（实验性） | `./install.sh --desktop-tweak` |
+
 ## 效果
 
-- 会话输入框工具栏里，“＋ 添加命令”按钮左边多一颗额度药丸：`⚡ 5h 94% · 周 56% · 月 78%`
+- 会话输入框工具栏里，"＋ 添加命令"按钮左边多一颗额度药丸：`⚡ 5h 94% · 周 56% · 月 78%`
 - 点药丸弹出详情：每周期进度条 + 已用/剩余% + 精确重置时间 + 倒计时
 - 右键药丸折叠成 `⚡`，再点恢复；状态跨刷新保持
-- 多账号 Tab 切换；`＋` 直接在网页里添加/删除账号 Key（写回服务器）
+- 多账号 Tab 切换；`＋` 直接在网页里添加/删除账号 Key（写回本机）
 - 跟随 codeg 语言（中文/英文自动切换）
+- 高用量提醒（5h 已用 >80% 红色脉冲 + 浏览器通知）、24h 用量曲线、数据过期灰显
 
 ## 原理
 
@@ -22,9 +31,11 @@ Authorization: Bearer sk-...
 → {"usage":{"rolling":{"percent":6,"resetsAt":"..."},"weekly":{...},"monthly":{...}}}
 ```
 
-`percent` 为**已用**百分比，剩余 = `100 - percent`。前端不直接碰 Key：由服务器端定时任务拉取后写成静态 `opencode-quota.json`，前端只读该文件。
+`percent` 为**已用**百分比，剩余 = `100 - percent`。前端不直接碰 Key：由后台定时任务拉取后写成 `opencode-quota.json`，前端只读该文件（桌面注入模式经本机 sidecar `:3081` 读取）。
 
-## 一键安装
+## 安装
+
+### Linux（codeg-server + systemd）
 
 ```bash
 git clone https://github.com/gyc0109/codeg-opencode-quota-widget.git
@@ -32,13 +43,44 @@ cd codeg-opencode-quota-widget
 sudo ./install.sh
 ```
 
-安装脚本会做：复制前端 JS 到 codeg 的 web 目录、注入全部页面、装两个 systemd 服务、生成账号配置模板。装完浏览器 `Ctrl+F5` 硬刷新即可。
+需求：systemd 的 codeg-server、Python3（仅标准库）。
 
-需求：Linux + systemd 的 codeg-server（如官方 `install.sh` 装的），Python3（仅标准库，无第三方依赖）。
+### macOS（用户级，无需 sudo）
+
+```bash
+./install.sh                  # 基础：额度抓取 + 本机账号接口（launchd 常驻）
+./install.sh --browser        # + 浏览器模式：把打补丁的 web UI 挂到本机 :3080
+./install.sh --desktop-tweak  # + 桌面版注入：codeg.app 窗口内直接显示药丸（实验性，见下）
+```
+
+macOS 上安装内容：
+
+- `~/.local/share/codeg-opencode-quota/`：脚本、前端母本、web 副本（浏览器模式）、备份
+- `~/Library/LaunchAgents/app.codeg.opencode-quota.{updater,api,server,repair}.plist`
+- `~/Library/Logs/codeg-opencode-quota/`：各服务日志
+- 账号配置 `~/.config/opencode/quota-accounts.json`（自动从 `opencode.jsonc` 或 `~/.codeg/opencode-go-key` 导入）
+
+#### 浏览器模式（`--browser`）
+
+用独立 `codeg-server` 进程在 `:3080` 提供打补丁的 web UI（数据目录与桌面版共享）：
+
+- 浏览器访问 `http://127.0.0.1:3080/`，首次在登录页填安装时打印的 token
+- 与桌面版可同时运行；不想要了：`./uninstall.sh` 或只删 server 相关 plist
+
+#### 桌面注入模式（`--desktop-tweak`，实验性）
+
+codeg 桌面版的 web UI 资源**内嵌在二进制里**，磁盘 web 目录注入无效，唯一可行路径是
+dylib 注入（`WKWebView` userScript 注入前端脚本）：
+
+- 安装时会给 codeg.app **ad-hoc 重签**（保留 hardened runtime，附加两个放行 entitlement）
+- **副作用**：macOS 可能把 codeg 当"新 app"，重新弹窗询问文件夹/钥匙串权限——重新授权即可
+- 需要**重启 codeg** 才生效；codeg 自动更新会整体替换 bundle，repair agent（launchd WatchPaths）会自动重新注入
+- 回滚：`~/.local/share/codeg-opencode-quota/bin/codeg-opencode-quota-repair --remove`
+  （有同版本官方备份时整体还原；否则剥离注入并重签，或重装官方包）
 
 ## 配置账号
 
-配置文件 `/root/.config/opencode/quota-accounts.json`（权限 600，明文 Key，注意保管）：
+配置文件 `~/.config/opencode/quota-accounts.json`（Linux root 为 `/root/.config/...`，权限 600，明文 Key，注意保管）：
 
 ```json
 [
@@ -47,40 +89,57 @@ sudo ./install.sh
 ]
 ```
 
-- 文件不存在时自动回退到 `~/.config/opencode/opencode.jsonc` 里的单个 Key
-- 也可以直接在网页详情浮层点 `＋` 添加（后端会先校验 Key 有效性再写入，所有浏览器共享）
-- 后台每 60 秒刷新一次：`OPENCODE_QUOTA_INTERVAL=60`
+- 文件不存在时自动回退：`opencode.jsonc` 里的 `apiKey` → `~/.codeg/opencode-go-key`
+- 也可以直接在网页详情浮层点 `＋` 添加（后端先校验 Key 有效性再写入，所有浏览器共享）
+- 后台默认每 60 秒刷新：`OPENCODE_QUOTA_INTERVAL=60`
 
 ## 端口
 
-- `:3080` codeg-server 本体（额度数据：`/opencode-quota.json`）
-- `:3081` 账号管理接口（增删账号，需带 codeg token，前端自动处理）。浏览器需能访问该端口，否则网页内添加账号会报网络错，改文件方式不受影响
+- `:3080` codeg 本体（Linux 服务端 / macOS 浏览器模式的独立 server）；额度数据可经 `:3081/quota.json` 读取
+- `:3081` 账号管理接口（增删账号 + 额度数据只读转发）。macOS 仅监听 `127.0.0.1`；Linux 默认监听 `0.0.0.0`（可用 `OPENCODE_QUOTA_API_HOST` 收紧）。浏览器需能访问该端口，否则网页内添加账号会报网络错，改文件方式不受影响
+
+## 数据流
+
+```
+updater(定时) ──写──> data 目录（规范） + web 静态根（存在时镜像，供同源 fetch）
+前端 ── http(s) 页面 ──> 同源 /opencode-quota.json
+     └─ 桌面壳(tauri://) ──> http://127.0.0.1:3081/quota.json（sidecar 转发）
+```
 
 ## 文件结构
 
 ```
 ├── web/opencode-quota.js            # 前端：药丸 + 详情浮层（中英自适应）
-├── bin/codeg-opencode-quota-updater # 后端：定时拉取多账号用量 → opencode-quota.json
-├── bin/codeg-opencode-quota-api     # 后端：账号增删接口（:3081，token 鉴权）
-├── bin/codeg-opencode-quota-patch   # 升级持久化：恢复 JS + 重注 html（codeg 升级不丢）
-├── systemd/                         # 两个 service + codeg 的 ExecStartPre drop-in
+├── bin/_codeg_quota_common.py       # 平台/路径/配置解析（Linux + macOS 共用）
+├── bin/codeg-opencode-quota-updater # 后端：定时拉取多账号用量 → json + 24h 历史
+├── bin/codeg-opencode-quota-api     # 后端：账号增删 + /quota.json 转发（:3081）
+├── bin/codeg-opencode-quota-patch   # 升级持久化：恢复 js + 递归重注 html（含原文备份）
+├── bin/codeg-opencode-quota-repair  # macOS：codeg.app dylib 注入维护（备份/注入/还原）
+├── systemd/                         # Linux 服务与 codeg ExecStartPre drop-in
+├── launchd/                         # macOS LaunchAgent 模板（updater/api/server/repair）
+├── tweak/                           # macOS 注入 dylib 源码 + 测试宿主
 ├── install.sh / uninstall.sh
 ```
 
-`uninstall.sh` 会完整清理（含 html 注入标签），账号配置文件保留。
+`uninstall.sh` 会完整清理（含 html 注入、launchd/systemd 服务、codeg.app 还原），账号配置文件保留。
+
+## 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `OPENCODE_QUOTA_INTERVAL` | 抓取间隔秒数（默认 60） |
+| `OPENCODE_QUOTA_API_PORT` / `OPENCODE_QUOTA_API_HOST` | 管理接口监听（默认 3081；host 默认 macOS=127.0.0.1，Linux=0.0.0.0） |
+| `OPENCODE_QUOTA_ACCOUNTS` | 账号文件路径 |
+| `CODEG_QUOTA_DATA_DIR` | 数据目录（json/历史） |
+| `CODEG_QUOTA_WEB_ROOT` | 前端静态根（一般不用设，平台默认） |
+| `CODEG_STATIC_DIR` | codeg web 静态目录（Linux 服务端模式用） |
 
 ## 隐私
 
-- Key 只存在服务器 `600` 文件和服务端内存；前端拿到的只有百分比和重置时间，列表接口仅返回 Key 前 10 位脱敏
+- Key 只存在本机 600 文件和服务端内存；前端拿到的只有百分比和重置时间，列表接口仅返回 Key 前 10 位脱敏
 - 能进你 codeg 网页的人理论上能调管理接口（与 codeg 同权），请自行保护好 codeg 访问 token
+- macOS 浏览器模式的静态文件（含额度百分比）不鉴权，同 Linux 行为；如需仅本机访问见 `OPENCODE_QUOTA_API_HOST` 与系统防火墙
 
 ## License
 
 MIT
-
-## 更多功能
-
-- **高用量提醒**：5 小时已用超 80% 时药丸红色脉冲，点击药丸时会申请浏览器通知权限并推送一次（恢复后重超才重报）
-- **24 小时用量曲线**：后台每次抓取 append 一行到 `opencode-quota-history.jsonl`（保留约 25 小时），详情浮层里看峰值
-- **过期灰显**：后台超过 3 分钟没抓到新数据，药丸变淡，悬停/浮层显示“x 分钟前”
-- **Esc 关闭浮层**；右键折叠成 `⚡`

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>app.codeg.opencode-quota.server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@@CODEG_SERVER@@</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CODEG_STATIC_DIR</key>
+		<string>@@WEBROOT@@</string>
+		<key>CODEG_TOKEN</key>
+		<string>@@TOKEN@@</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@@LOGDIR@@/server.log</string>
+	<key>StandardErrorPath</key>
+	<string>@@LOGDIR@@/server.log</string>
+</dict>
+</plist>

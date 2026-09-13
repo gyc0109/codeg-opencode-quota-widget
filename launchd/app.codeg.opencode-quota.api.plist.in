@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>app.codeg.opencode-quota.api</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@@PY@@</string>
+		<string>@@LIB@@/bin/codeg-opencode-quota-api</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OPENCODE_QUOTA_API_HOST</key>
+		<string>127.0.0.1</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@@LOGDIR@@/api.log</string>
+	<key>StandardErrorPath</key>
+	<string>@@LOGDIR@@/api.log</string>
+</dict>
+</plist>

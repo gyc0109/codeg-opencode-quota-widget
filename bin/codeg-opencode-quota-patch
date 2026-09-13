@@ -1,31 +1,76 @@
 #!/usr/bin/env python3
-import glob, os, shutil
-web = os.environ.get("CODEG_STATIC_DIR", "/usr/local/share/codeg/web")
-master = "/usr/local/share/codeg-opencode-quota/opencode-quota.js"
-tag = '<script src="/opencode-quota.js"></script>'
-# 1. 母本回拷：升级覆盖 web 目录后恢复 js 本体
-if os.path.isfile(master):
-    dst = os.path.join(web, "opencode-quota.js")
-    if (not os.path.isfile(dst)) or (open(master,'rb').read() != open(dst,'rb').read()):
-        shutil.copy2(master, dst)
-        print(f"opencode-quota-patch: restored {dst}")
-# 2. html 注入（幂等）
-count = 0
-for path in glob.glob(os.path.join(web, "*.html")):
-    try:
-        s = open(path, encoding="utf-8", errors="surrogateescape").read()
-    except OSError: continue
-    if "/opencode-quota.js" in s:
-        continue
-    if "</head>" in s:
-        s = s.replace("</head>", tag + "</head>", 1)
-    elif "</body>" in s:
-        s = s.replace("</body>", tag + "</body>", 1)
-    else:
-        continue
-    tmp = path + ".quota.tmp"
-    open(tmp, "w", encoding="utf-8", errors="surrogateescape").write(s)
-    os.replace(tmp, path)
-    count += 1
-    print(f"opencode-quota-patch: injected {path}")
-print(f"opencode-quota-patch: done, patched {count} files")
+"""codeg-opencode-quota 前端注入（幂等）。
+
+- 母本 js 从 lib 目录回拷到 web 根（升级覆盖 web 目录后自动恢复）
+- 所有 html 注入 <script src="/opencode-quota.js"></script>（递归，幂等）
+- 注入前把未注入过的原文备份到 lib/html-backup/（供卸载还原 / 升级后自动换新备份）
+
+web 根不存在时直接退出（未启用浏览器模式/未装 codeg 的机器上安全 no-op）。
+"""
+import os
+import pathlib
+import shutil
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _codeg_quota_common as common  # noqa: E402
+
+TAG = '<script src="/opencode-quota.js"></script>'
+
+
+def main():
+    web = common.web_root()
+    if not web.is_dir():
+        print("opencode-quota-patch: web root not found, skip: %s" % web)
+        return 0
+    lib = common.lib_dir()
+    master = lib / "opencode-quota.js"
+    backup_dir = lib / "html-backup"
+
+    # 1. 母本回拷：升级覆盖 web 目录后恢复 js 本体
+    if master.is_file():
+        dst = web / "opencode-quota.js"
+        try:
+            if (not dst.is_file()) or (master.read_bytes() != dst.read_bytes()):
+                shutil.copy2(master, dst)
+                print("opencode-quota-patch: restored %s" % dst)
+        except OSError as e:
+            print("opencode-quota-patch: restore failed: %s" % e, file=sys.stderr)
+
+    # 2. html 注入（幂等；递归覆盖嵌套页面）
+    count = 0
+    for path in sorted(web.rglob("*.html")):
+        try:
+            s = path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        rel = path.relative_to(web)
+        bak = backup_dir / rel
+        if "/opencode-quota.js" in s:
+            continue
+        # 原文备份：无备份，或内容与备份不同（codeg 升级后的新原文）→ 刷新备份
+        try:
+            cur = path.read_bytes()
+            if (not bak.is_file()) or bak.read_bytes() != cur:
+                bak.parent.mkdir(parents=True, exist_ok=True)
+                bak.write_bytes(cur)
+        except OSError as e:
+            print("opencode-quota-patch: backup failed (%s): %s" % (rel, e), file=sys.stderr)
+        if "</head>" in s:
+            s = s.replace("</head>", TAG + "</head>", 1)
+        elif "</body>" in s:
+            s = s.replace("</body>", TAG + "</body>", 1)
+        else:
+            continue
+        tmp = str(path) + ".quota.tmp"
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(s)
+        os.replace(tmp, path)
+        count += 1
+        print("opencode-quota-patch: injected %s" % rel)
+    print("opencode-quota-patch: done, patched %d files" % count)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

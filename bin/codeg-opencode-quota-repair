@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""codeg 桌面版注入维护：给 codeg.app 注入 dylib（Info.plist LSEnvironment + ad-hoc 重签）。
+
+用法:
+  codeg-opencode-quota-repair            # 需要时修复（幂等；repair LaunchAgent 调用）
+  codeg-opencode-quota-repair --force    # 强制重新注入
+  codeg-opencode-quota-repair --remove   # 移除注入：有同版本官方备份则整体还原，否则剥离注入并重签
+  --app PATH                             # 覆盖 app 路径（dry-run 测试用）
+
+原理: 官方版检测（Developer ID 签名）→ 快照备份 → 复制 dylib 到 Contents/Frameworks/
+      → Info.plist 增加 LSEnvironment.DYLD_INSERT_LIBRARIES → ad-hoc 重签（保留 hardened runtime，
+      附 allow-dyld-environment-variables + disable-library-validation）。
+codeg 自动更新会整体替换 bundle，本脚本检测到官方签名后自动重新注入。
+"""
+import argparse
+import datetime
+import pathlib
+import plistlib
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _codeg_quota_common as common  # noqa: E402
+
+DYLD_NAME = "libcodegquota.dylib"
+ENT_NAME = "quota-tweak.entitlements"
+DEFAULT_APP = "/Applications/codeg.app"
+
+
+def log(msg):
+    print("[%s] %s" % (datetime.datetime.now().strftime("%H:%M:%S"), msg), flush=True)
+
+
+def run(args):
+    return subprocess.run([str(a) for a in args], capture_output=True, text=True)
+
+
+def read_plist(path):
+    raw = pathlib.Path(path).read_bytes()
+    return plistlib.loads(raw), (plistlib.FMT_BINARY if raw[:6] == b"bplist" else plistlib.FMT_XML)
+
+
+def write_plist(path, data, fmt):
+    pathlib.Path(path).write_bytes(plistlib.dumps(data, fmt=fmt))
+
+
+def app_version(plist_path):
+    try:
+        d, _ = read_plist(plist_path)
+        return str(d.get("CFBundleShortVersionString", "?"))
+    except Exception:
+        return "?"
+
+
+def signature_kind(app):
+    """official / adhoc / invalid / unknown"""
+    r = run(["codesign", "-dvv", app])
+    out = r.stdout + r.stderr
+    if r.returncode != 0 and "code object is not signed" in out:
+        return "invalid"
+    if "Signature=adhoc" in out:
+        return "adhoc"
+    if "Authority=Developer ID" in out:
+        return "official"
+    return "unknown" if r.returncode == 0 else "invalid"
+
+
+def verify_ok(app):
+    return run(["codesign", "--verify", app]).returncode == 0
+
+
+def current_dylib_path(app):
+    return pathlib.Path(app) / "Contents" / "Frameworks" / DYLD_NAME
+
+
+def injected_dylib_in_plist(app):
+    try:
+        d, _ = read_plist(pathlib.Path(app) / "Contents" / "Info.plist")
+    except Exception:
+        return None
+    return (d.get("LSEnvironment") or {}).get("DYLD_INSERT_LIBRARIES")
+
+
+def backup_dir():
+    return common.lib_dir() / "app-backup"
+
+
+def needs_repair(app, force):
+    if force:
+        return True, "forced"
+    if not current_dylib_path(app).is_file():
+        return True, "dylib missing"
+    if injected_dylib_in_plist(app) != str(current_dylib_path(app)):
+        return True, "LSEnvironment missing/stale"
+    if signature_kind(app) != "adhoc":
+        return True, "bundle signature is not ad-hoc (app was updated?)"
+    return False, "up to date"
+
+
+def snapshot_backup(app):
+    """官方版快照（仅当签名有效且为 Developer ID）。"""
+    if signature_kind(app) != "official":
+        log("skip snapshot: app is not officially signed")
+        return False
+    if not verify_ok(app):
+        log("skip snapshot: codesign verify failed (可能是更新进行中)")
+        return False
+    bdir = backup_dir()
+    bdir.mkdir(parents=True, exist_ok=True)
+    dst = bdir / "codeg.app"
+    if dst.exists():
+        shutil.rmtree(dst)
+    log("snapshot official bundle -> %s" % dst)
+    r = run(["ditto", app, dst])
+    if r.returncode != 0:
+        log("snapshot failed: %s" % (r.stderr.strip() or r.returncode))
+        return False
+    return True
+
+
+def apply(app, force):
+    app = pathlib.Path(app)
+    if not app.is_dir():
+        log("app not found: %s" % app)
+        return 1
+    lib = common.lib_dir()
+    src_dylib = lib / DYLD_NAME
+    ent = lib / ENT_NAME
+    if not src_dylib.is_file() or not ent.is_file():
+        log("dylib/entitlements missing in %s (run install --desktop-tweak first)" % lib)
+        return 1
+
+    need, why = needs_repair(app, force)
+    if not need:
+        return 0
+    log("injecting (%s)" % why)
+
+    if signature_kind(app) == "official":
+        snapshot_backup(app)
+    elif not backup_dir().joinpath("codeg.app").is_dir():
+        log("WARNING: 无官方备份且当前 bundle 非官方签名，卸载时只能剥离注入（建议届时重装官方包）")
+
+    dst_dylib = current_dylib_path(app)
+    dst_dylib.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_dylib, dst_dylib)
+
+    plist_path = app / "Contents" / "Info.plist"
+    data, fmt = read_plist(plist_path)
+    env = data.get("LSEnvironment") or {}
+    env["DYLD_INSERT_LIBRARIES"] = str(dst_dylib)
+    data["LSEnvironment"] = env
+    write_plist(plist_path, data, fmt)
+    log("Info.plist LSEnvironment set: %s" % dst_dylib)
+
+    r = run(["codesign", "--force", "--sign", "-", dst_dylib])
+    if r.returncode != 0:
+        log("codesign dylib failed: %s" % (r.stderr.strip() or r.returncode))
+        return 1
+    r = run(["codesign", "--force", "--sign", "-", "--options", "runtime",
+             "--entitlements", ent, app])
+    if r.returncode != 0:
+        log("codesign app failed: %s" % (r.stderr.strip() or r.returncode))
+        return 1
+    if verify_ok(app):
+        log("injected & re-signed ok (v%s)" % app_version(plist_path))
+    else:
+        log("WARNING: codesign verify failed after re-sign")
+        return 1
+    return 0
+
+
+def remove(app):
+    app = pathlib.Path(app)
+    bdir = backup_dir() / "codeg.app"
+    cur_ver = app_version(app / "Contents" / "Info.plist")
+    bak_ver = app_version(bdir / "Contents" / "Info.plist") if bdir.is_dir() else "?"
+    if bdir.is_dir() and cur_ver == bak_ver:
+        log("restoring official bundle from backup (v%s)" % cur_ver)
+        r = run(["rsync", "-a", "--delete", str(bdir) + "/", str(app) + "/"])
+        if r.returncode != 0:
+            log("restore failed: %s" % (r.stderr.strip() or r.returncode))
+            return 1
+        log("restored; signature: %s, verify: %s" % (signature_kind(app), verify_ok(app)))
+        return 0
+    log("no matching official backup (current=%s backup=%s); stripping injection instead" % (cur_ver, bak_ver))
+    dst_dylib = current_dylib_path(app)
+    if dst_dylib.is_file():
+        dst_dylib.unlink()
+    plist_path = app / "Contents" / "Info.plist"
+    try:
+        data, fmt = read_plist(plist_path)
+        env = data.get("LSEnvironment") or {}
+        env.pop("DYLD_INSERT_LIBRARIES", None)
+        if env:
+            data["LSEnvironment"] = env
+        else:
+            data.pop("LSEnvironment", None)
+        write_plist(plist_path, data, fmt)
+    except Exception as e:
+        log("plist edit failed: %s" % e)
+        return 1
+    ent = common.lib_dir() / ENT_NAME
+    args = ["codesign", "--force", "--sign", "-", "--options", "runtime"]
+    if ent.is_file():
+        args += ["--entitlements", ent]
+    args.append(app)
+    r = run(args)
+    if r.returncode != 0:
+        log("re-sign failed: %s" % (r.stderr.strip() or r.returncode))
+        return 1
+    log("injection stripped (bundle remains ad-hoc signed; 重装官方包可完全恢复)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--remove", action="store_true")
+    ap.add_argument("--app", default=DEFAULT_APP)
+    args = ap.parse_args()
+    if args.remove:
+        return remove(args.app)
+    return apply(args.app, args.force)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

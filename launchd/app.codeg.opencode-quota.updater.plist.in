@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>app.codeg.opencode-quota.updater</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@@PY@@</string>
+		<string>@@LIB@@/bin/codeg-opencode-quota-updater</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@@LOGDIR@@/updater.log</string>
+	<key>StandardErrorPath</key>
+	<string>@@LOGDIR@@/updater.log</string>
+</dict>
+</plist>
