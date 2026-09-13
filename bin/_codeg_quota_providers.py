@@ -67,9 +67,10 @@ class KeyAdapter:
         return w
 
 
-def _get_json(url, key, timeout=15, retries=2):
+def _get_json(url, key, timeout=15, retries=3):
     """GET + JSON。TLS/连接类瞬断（如 EOF in violation of protocol）自动重试；
-    HTTP 错误（401/4xx/5xx）立即抛出，不拿无效 key 反复打。"""
+    HTTP 错误（401/4xx/5xx）立即抛出，不拿无效 key 反复打。
+    代理：遵循标准 HTTP(S)_PROXY/NO_PROXY 环境变量（urllib 原生支持）。"""
     last = None
     for attempt in range(retries):
         try:

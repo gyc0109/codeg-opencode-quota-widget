@@ -30,6 +30,24 @@ detect_python() {
   else command -v python3; fi
 }
 
+# 探测本机代理（Clash/Surge 等常见端口）：能经它 TLS 访问 opencode.ai 则返回其 URL。
+# 后台 launchd 任务不继承终端代理环境，国内直连 opencode.ai 常被干扰，探测到就注入 plist。
+detect_proxy() {
+  "$PY" - <<'PYEOF' 2>/dev/null || true
+import urllib.request
+url = "https://opencode.ai/"
+for cand in ("http://127.0.0.1:7897", "http://127.0.0.1:7890", "http://127.0.0.1:1087"):
+    try:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": cand, "https": cand}))
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        op.open(req, timeout=6)
+        print(cand)
+        break
+    except Exception:
+        pass
+PYEOF
+}
+
 # sed 替换值转义：先做 XML 转义（plist 里 & < 非法），再做 sed 替换转义（& | \）
 esc() {
   local v="$1"
@@ -100,6 +118,16 @@ install_macos() {
   echo "==> 安装 launchd 服务（updater / api）"
   render_plist "$SRC/launchd/app.codeg.opencode-quota.updater.plist.in" \
                "$AGENTS/app.codeg.opencode-quota.updater.plist"
+  PROXY_URL="$(detect_proxy)"
+  if [ -n "$PROXY_URL" ]; then
+    UPD="$AGENTS/app.codeg.opencode-quota.updater.plist"
+    /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables" "$UPD" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$UPD"
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:HTTPS_PROXY string $PROXY_URL" "$UPD"
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:HTTP_PROXY string $PROXY_URL" "$UPD"
+    /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:NO_PROXY string 127.0.0.1,localhost" "$UPD"
+    echo "    检测到本机代理 $PROXY_URL，已注入后台抓取任务（代理自行按规则分流）"
+  fi
   render_plist "$SRC/launchd/app.codeg.opencode-quota.api.plist.in" \
                "$AGENTS/app.codeg.opencode-quota.api.plist"
   bootstrap_agent app.codeg.opencode-quota.updater "$AGENTS/app.codeg.opencode-quota.updater.plist"
