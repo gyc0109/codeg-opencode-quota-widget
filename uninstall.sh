@@ -56,8 +56,12 @@ uninstall_linux() {
         /usr/local/bin/codeg-opencode-quota-patch \
         /usr/local/bin/codeg-opencode-quota-repair \
         /usr/local/bin/_codeg_quota_common.py \
+        /usr/local/bin/_codeg_quota_providers.py \
+        /usr/local/bin/_codeg_quota_sources.py \
         "$WEB_DIR/opencode-quota.js" \
+        "$WEB_DIR/quota.html" \
         "$WEB_DIR/opencode-quota.json" \
+        "$WEB_DIR/opencode-quota-sources.json" \
         "$WEB_DIR/opencode-quota-history.jsonl"
   rm -rf /usr/local/share/codeg-opencode-quota
   rm -rf /var/log/codeg-opencode-quota

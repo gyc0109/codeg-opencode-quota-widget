@@ -141,8 +141,37 @@ class DeepSeekAdapter(KeyAdapter):
         return {"windows": [window], "extra": extra}
 
 
+class OpenRouterAdapter(KeyAdapter):
+    type_id = "openrouter"
+    display_name = {"zh": "OpenRouter", "en": "OpenRouter"}
+    key_pattern = re.compile(r"sk-or-[A-Za-z0-9_-]{8,}")
+    default_interval_s = 300
+    URL = "https://openrouter.ai/api/v1/credits"
+    windows = [
+        WindowSpec("credits", {"zh": "余额", "en": "Credits"}, primary=True,
+                   kind="money", direction="left",
+                   alert={"below": 5, "runOutHours": 24}),
+    ]
+
+    def fetch(self, key):
+        return _get_json(self.URL, key)
+
+    def normalize(self, raw):
+        d = raw.get("data", raw)
+        if not isinstance(d, dict):
+            raise ValueError("unexpected credits response")
+        total = float(d.get("total_credits") or 0)
+        used = float(d.get("total_usage") or 0)
+        remain = round(total - used, 6)
+        spec = self.windows[0]
+        window = self._window(spec, value=remain, unit="USD")
+        extra = {"balance": {"currency": "USD", "total": remain,
+                             "toppedUp": total, "granted": 0.0, "available": True}}
+        return {"windows": [window], "extra": extra}
+
+
 ADAPTERS = {}
-for _cls in (OpenCodeGoAdapter, DeepSeekAdapter):
+for _cls in (OpenCodeGoAdapter, DeepSeekAdapter, OpenRouterAdapter):
     ADAPTERS[_cls.type_id] = _cls()
 
 

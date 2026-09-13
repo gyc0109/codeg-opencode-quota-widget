@@ -91,6 +91,7 @@ install_macos() {
   cp "$SRC/bin/"* "$LIB/bin/"
   chmod +x "$LIB/bin/codeg-opencode-quota-"*
   cp "$SRC/web/opencode-quota.js" "$LIB/opencode-quota.js"
+  cp "$SRC/web/quota.html" "$LIB/quota.html"
 
   echo "==> 账号配置"
   install_accounts_template "$LIB/bin"
@@ -138,6 +139,7 @@ install_macos() {
                    "s|@@APP@@|$(esc "$APP")|g"
       bootstrap_agent app.codeg.opencode-quota.repair "$AGENTS/app.codeg.opencode-quota.repair.plist"
       echo "    浏览器访问: http://127.0.0.1:$SERVER_PORT/ （局域网内其他设备可用本机 IP 访问；端口可用 CODEG_QUOTA_SERVER_PORT 覆盖）"
+      echo "    额度面板(网页): http://127.0.0.1:$SERVER_PORT/quota.html"
       echo "    登录 token: $TOKEN（首次访问登录页填入）"
     fi
   fi
@@ -170,6 +172,7 @@ EOT
   fi
 
   echo "==> 完成。日志目录: $LOGDIR"
+  echo "    额度面板(免补丁): 在 codeg 里用「HTML 预览」打开 $LIB/quota.html"
 }
 
 # ---------------------------------------------------------------- Linux
@@ -190,6 +193,8 @@ install_linux() {
   mkdir -p "$LIB" "$LOGDIR"
   cp "$SRC/web/opencode-quota.js" "$LIB/opencode-quota.js"
   cp "$SRC/web/opencode-quota.js" "$WEB_DIR/opencode-quota.js"
+  cp "$SRC/web/quota.html" "$LIB/quota.html"
+  cp "$SRC/web/quota.html" "$WEB_DIR/quota.html"
   cp "$SRC/bin/"* /usr/local/bin/
   rm -f /usr/local/bin/codeg-opencode-quota-repair   # macOS 专用
   chmod +x /usr/local/bin/codeg-opencode-quota-updater \

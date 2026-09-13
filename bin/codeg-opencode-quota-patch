@@ -28,7 +28,7 @@ def main():
     master = lib / "opencode-quota.js"
     backup_dir = lib / "html-backup"
 
-    # 1. 母本回拷：升级覆盖 web 目录后恢复 js 本体
+    # 1. 母本回拷：升级覆盖 web 目录后恢复 js/html 本体
     if master.is_file():
         dst = web / "opencode-quota.js"
         try:
@@ -37,10 +37,21 @@ def main():
                 print("opencode-quota-patch: restored %s" % dst)
         except OSError as e:
             print("opencode-quota-patch: restore failed: %s" % e, file=sys.stderr)
+    master_html = lib / "quota.html"
+    if master_html.is_file():
+        dst_html = web / "quota.html"
+        try:
+            if (not dst_html.is_file()) or (master_html.read_bytes() != dst_html.read_bytes()):
+                shutil.copy2(master_html, dst_html)
+                print("opencode-quota-patch: restored %s" % dst_html)
+        except OSError as e:
+            print("opencode-quota-patch: quota.html copy failed: %s" % e, file=sys.stderr)
 
     # 2. html 注入（幂等；递归覆盖嵌套页面）
     count = 0
     for path in sorted(web.rglob("*.html")):
+        if path.name == "quota.html":  # 面板页自身不注入药丸脚本
+            continue
         try:
             cur = path.read_bytes()
         except OSError:

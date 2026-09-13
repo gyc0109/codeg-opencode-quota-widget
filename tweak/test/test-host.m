@@ -9,12 +9,32 @@ static NSString *const kMockHTML =
      "<div style='display:flex;gap:8px'><div class='group/cmd'>"
      "<button>＋ 添加命令</button></div></div></div></body></html>";
 
+// CODEG_QUOTA_TEST_SRCDOC_PATH：把指定 html 以 codeg 预览同款 sandbox iframe(srcdoc) 方式嵌入
+static NSString *PageHTML(void) {
+    const char *p = getenv("CODEG_QUOTA_TEST_SRCDOC_PATH");
+    if (!p || !p[0]) {
+        return kMockHTML;
+    }
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:p]
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    if (!src.length) {
+        return kMockHTML;
+    }
+    NSString *esc = [[src stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
+                        stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
+    return [NSString stringWithFormat:
+        @"<!DOCTYPE html><html><body style='margin:0'>"
+         "<iframe sandbox=\"allow-scripts\" style=\"width:100vw;height:100vh;border:0\" "
+         "srcdoc=\"%@\"></iframe></body></html>", esc];
+}
+
 @interface MockSchemeHandler : NSObject <WKURLSchemeHandler>
 @end
 
 @implementation MockSchemeHandler
 - (void)webView:(WKWebView *)webView startURLSchemeTask:(id<WKURLSchemeTask>)task {
-    NSData *data = [kMockHTML dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *data = [PageHTML() dataUsingEncoding:NSUTF8StringEncoding];
     NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
         initWithURL:task.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
         headerFields:@{@"Content-Type": @"text/html; charset=utf-8",
@@ -44,8 +64,11 @@ static NSString *const kMockHTML =
                                                  defer:NO];
     self.window.contentView = self.webView;
     [self.window makeKeyAndOrderFront:nil];
+    const char *tu = getenv("CODEG_QUOTA_TEST_URL");
+    NSString *loadURL = (tu && tu[0]) ? [NSString stringWithUTF8String:tu]
+                                      : @"tauri://localhost/index.html";
     [self.webView loadRequest:[NSURLRequest requestWithURL:
-        [NSURL URLWithString:@"tauri://localhost/index.html"]]];
+        [NSURL URLWithString:loadURL]]];
 
     // CODEG_QUOTA_TEST_OPEN=1：3 秒时自动点开药丸（弹层截图用）
     // CODEG_QUOTA_TEST_TAB=src:cc-switch 可先切到指定 tab

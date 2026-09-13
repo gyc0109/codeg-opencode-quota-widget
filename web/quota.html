@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>codeg 额度面板</title>
+<style>
+  :root{color-scheme:light dark}
+  body{font:13px/1.65 ui-sans-serif,system-ui;margin:0;padding:16px;background:transparent;color:#111}
+  @media(prefers-color-scheme:dark){body{color:#e8e8ea}}
+  .card{border:1px solid rgba(127,127,127,.25);border-radius:12px;padding:12px 14px;margin-bottom:12px;max-width:520px}
+  .card h2{font-size:13px;margin:0 0 8px;font-weight:650}
+  .muted{opacity:.6}.small{font-size:11px}
+  .row{display:flex;gap:10px;align-items:center;padding:4px 0}
+  .row .lbl{width:64px;opacity:.65;flex-shrink:0}
+  .bar{width:80px;height:6px;border-radius:99px;background:rgba(127,127,127,.2);overflow:hidden;flex-shrink:0}
+  .bar>i{display:block;height:100%}
+  .grow{flex:1}
+  .right{text-align:right}
+  .burn{padding:0 0 4px 74px;opacity:.65;font-size:11px}
+  hr{border:0;border-top:1px solid rgba(127,127,127,.18);margin:8px 0}
+  svg{display:block;width:100%;height:44px}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:99px;flex-shrink:0}
+  button{font:inherit;font-size:11px;background:transparent;border:1px solid rgba(127,127,127,.35);border-radius:99px;padding:2px 12px;cursor:pointer;color:inherit}
+  header{display:flex;align-items:baseline;gap:10px;max-width:520px;margin-bottom:10px}
+  header b{font-size:14px}
+</style>
+</head>
+<body>
+<header><b>⚡ codeg 额度</b><span class="muted small" id="stamp"></span><span class="grow"></span><button id="rf">刷新</button></header>
+<div id="app"><div class="muted">加载中…</div></div>
+<script>
+(function(){
+  "use strict";
+  var IS_HTTP=/^https?:$/.test(location.protocol);
+  var ORIGIN=IS_HTTP?location.origin:"http://127.0.0.1:3081";  // file:// / srcdoc 预览 → 本机 sidecar
+  // http(s) 同源走静态文件；sidecar 走短名端点
+  var JSON_URL=IS_HTTP?ORIGIN+"/opencode-quota.json":ORIGIN+"/quota.json";
+  var SRC_URL=IS_HTTP?ORIGIN+"/opencode-quota-sources.json":ORIGIN+"/quota-sources.json";
+  var HIST_URL=IS_HTTP?ORIGIN+"/opencode-quota-history.jsonl":ORIGIN+"/quota-history.jsonl";
+  var POLL=60000;
+  var LANG=(function(){
+    try{var m=document.cookie.match(/codeg\.locale=([^;]+)/);if(m)return decodeURIComponent(m[1]).toLowerCase().indexOf("zh")===0?"zh":"en";}catch(e){}
+    return (navigator.language||"").toLowerCase().indexOf("zh")===0?"zh":"en";
+  })();
+  var STR={
+    zh:{quota:"订阅额度",sources:"本机网关 · CC Switch",codegUsage:"codeg 用量",
+        today:"今日",hour:"近1小时",d30:"近30天",cost:"花费",month:"本月",cache:"缓存读取",
+        req:"请求",err:"错误",turns:"轮",byModel:"按模型",byAgent:"按 agent",
+        left:"剩",used:"已用",noData:"暂无数据",stale:"数据暂不可用",acctStale:"数据为上次成功抓取",
+        dailyLimit:"日限额",monthlyLimit:"月限额",upd:"更新于",drainOut:function(c){return "约"+c+"耗尽";},
+        runOut:function(c){return "预计"+c+"耗尽";},perHour:"/时",noTrend:"暂无趋势"},
+    en:{quota:"Subscription quota",sources:"Local gateway · CC Switch",codegUsage:"codeg usage",
+        today:"Today",hour:"Last hour",d30:"Last 30d",cost:"Cost",month:"month",cache:"Cache read",
+        req:"req",err:"err",turns:"turns",byModel:"By model",byAgent:"By agent",
+        left:"left",used:"used",noData:"No data",stale:"data unavailable",acctStale:"last successful fetch",
+        dailyLimit:"Daily limit",monthlyLimit:"Monthly limit",upd:"updated",drainOut:function(c){return "runs out "+c.replace(" left","");},
+        runOut:function(c){return "runs out ~"+c.replace(" left","");},perHour:"/h",noTrend:"no trend"}
+  };
+  function S(){return STR[LANG];}
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+  function L(o){return o==null?"":(typeof o==="string"?o:(o[LANG]||o.en||o.zh||""));}
+  function color(p){return p>=90?"#ef4444":p>=70?"#eab308":"#22c55e";}
+  function money(v,u){if(v==null)return "—";var s=u==="CNY"?"¥":(u==="USD"?"$":"");var n=Math.abs(v)>=1000?String(Math.round(v)):(Math.abs(v)>=100?Number(v).toFixed(1):Number(v).toFixed(2));return s?s+n:(n+" "+(u||""));}
+  function toks(n){n=Number(n)||0;if(n>=1e9)return (n/1e9).toFixed(2)+"B";if(n>=1e6)return (n/1e6).toFixed(1)+"M";if(n>=1e3)return (n/1e3).toFixed(1)+"K";return String(n);}
+  function pad(n){return (n<10?"0":"")+n;}
+  function cd(s){var d=new Date(s).getTime()-Date.now();if(d<=0)return LANG==="zh"?"已重置":"reset";
+    var dd=Math.floor(d/864e5),h=Math.floor(d%864e5/36e5),m=Math.floor(d%36e5/6e4);
+    if(dd>0)return LANG==="zh"?dd+"天"+h+"小时后":dd+"d "+h+"h left";
+    if(h>0)return LANG==="zh"?h+"小时"+m+"分后":h+"h "+m+"m left";
+    return LANG==="zh"?m+"分后":m+"m left";}
+  function fdate(s){var d=new Date(s);return (d.getMonth()+1)+"/"+d.getDate()+" "+pad(d.getHours())+":"+pad(d.getMinutes());}
+  function spark(vals){
+    if(!vals||vals.length<2)return "";
+    var W=460,H=44,p=2,max=Math.max.apply(null,vals),min=Math.min.apply(null,vals),sp=(max-min)||1;
+    var d=vals.map(function(v,k){return (p+k/(vals.length-1)*(W-p*2)).toFixed(1)+","+(H-5-((v-min)/sp)*(H-12)).toFixed(1);}).join(" ");
+    return '<svg viewBox="0 0 '+W+' '+H+'"><polyline points="'+d+'" fill="none" stroke="currentColor" stroke-opacity=".55" stroke-width="1.5"/></svg>';
+  }
+  function burnLine(w){
+    if(!w.burn||w.burn.perHour==null)return "";
+    var r=w.burn.perHour,tx=(r>0?"↑":"↓")+(w.kind==="percent"?Math.abs(r)+"%"+S().perHour:money(Math.abs(r),w.unit)+S().perHour);
+    var tail=w.burn.runOutAt?S().drainOut(cd(w.burn.runOutAt)):S().noTrend;
+    return '<div class="burn">'+esc(tx)+' · '+esc(tail)+'</div>';
+  }
+  function winRow(w){
+    var pct=w.kind==="percent"?w.percent:((w.kind==="budget"&&w.limit)?Math.round(w.value/w.limit*100):null);
+    var bar=pct!=null?'<span class="bar"><i style="width:'+Math.min(100,Math.max(0,pct))+'%;background:'+color(pct)+'"></i></span>':'<span class="bar" style="visibility:hidden"></span>';
+    var val=w.kind==="percent"?'<b>'+(LANG==="zh"?(100-w.percent)+"% "+S().left:w.percent+"% "+S().used)+'</b>'
+      :'<b>'+esc(money(w.value,w.unit))+'</b>'+(w.limit!=null?' <span class="muted">/ '+esc(money(w.limit,w.unit))+'</span>':'');
+    var reset=w.resetsAt?('<span class="muted small right">'+esc(fdate(w.resetsAt))+'<br>'+esc(cd(w.resetsAt))+'</span>'):'';
+    return '<div style="border-top:1px solid rgba(127,127,127,.14)"><div class="row"><span class="lbl">'+esc(L(w.label))+'</span>'+bar+'<span style="min-width:88px" class="right">'+val+'</span><span class="grow"></span>'+reset+'</div>'+burnLine(w)+'</div>';
+  }
+  function fmtErr(e){return esc(String(e||"").slice(0,90));}
+  function get(u){return fetch(u+"?t="+Date.now(),{cache:"no-store"}).then(function(r){if(!r.ok)throw 0;return r.json();});}
+  var state={accounts:null,sources:null,hist:null};
+  function render(){
+    var app=document.getElementById("app"),h="";
+    var acct=state.accounts||{},src=(state.sources||{}).sources||{},hist=state.hist||[];
+    // 1. 订阅额度
+    h+='<div class="card"><h2>'+esc(S().quota)+'</h2>';
+    var list=acct.accounts||[];
+    if(!list.length)h+='<div class="muted">'+esc(S().noData)+'</div>';
+    list.forEach(function(a){
+      var ws=a.windows||[];
+      h+='<div style="margin-bottom:6px"><b>'+esc(a.name||"")+'</b> <span class="muted">'+esc(a.provider||"")+'</span>'
+        +(a.stale?' <span class="small" style="color:#eab308">⚠ '+esc(S().acctStale)+'</span>':'')+'</div>';
+      if(a.error&&!ws.length){h+='<div class="small" style="color:#f87171">'+fmtErr(a.error)+'</div>';return;}
+      ws.forEach(function(w){if(w.kind!=="count")h+=winRow(w);});
+      // 主窗口 24h 曲线
+      var name=a.name||"",prov=a.provider||"opencode-go",vals=[];
+      hist.forEach(function(row){(row.a||[]).forEach(function(pt){if(pt.n!==name)return;var pp=pt.p;if(pp==null?prov!=="opencode-go":pp!==prov)return;if(pt.r!=null)vals.push(pt.r);});});
+      vals=vals.slice(-1440);
+      if(vals.length>1)h+=spark(vals);
+    });
+    h+='</div>';
+    // 2. CC Switch
+    var cs=src["cc-switch"];
+    h+='<div class="card"><h2>'+esc(S().sources)+'</h2>';
+    if(!cs)h+='<div class="muted">'+esc(S().noData)+'</div>';
+    else{
+      if(cs.stale)h+='<div class="small" style="color:#eab308">'+esc(S().stale)+'</div>';
+      var td=(cs.totals||{}).today||{},hr=(cs.totals||{}).hour||{},mo=(cs.totals||{}).month||{};
+      h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+td.requests+" "+esc(S().req)+" · "+td.errors+" "+esc(S().err)+" ("+Math.round((td.errorRate||0)*100)+"%)"
+        +" &nbsp; <span class='muted'>"+esc(S().cost)+"</span> "+esc(money(td.cost,"USD"))+" · "+esc(S().month)+" "+esc(money(mo.cost,"USD"))
+        +"<br><span class='muted'>"+esc(S().hour)+"</span> "+hr.requests+" "+esc(S().req)+" · "+hr.errors+" "+esc(S().err)+"</div>";
+      (cs.limits||[]).forEach(function(l){h+=winRow({kind:"budget",label:{zh:l.window==="daily"?S().dailyLimit:S().monthlyLimit,en:l.window==="daily"?S().dailyLimit:S().monthlyLimit},value:l.value,limit:l.limit,unit:l.unit});});
+      if((cs.health||[]).length){
+        h+='<hr>';
+        cs.health.forEach(function(x){
+          var c=x.healthy===false?"#ef4444":((x.consecutiveFailures||0)>0?"#eab308":"#22c55e");
+          h+='<div class="row small"><span class="dot" style="background:'+c+'"></span><span>'+esc(x.name)+' <span class="muted">'+esc(x.app)+'</span></span><span class="grow"></span><span class="muted right" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+fmtErr(x.lastError)+'</span></div>';
+        });
+      }
+      if((cs.models||[]).length){
+        h+='<hr><div class="small muted">'+esc(S().byModel)+'</div>';
+        cs.models.slice(0,5).forEach(function(m){
+          h+='<div class="row small"><span style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(m.model)+'</span><span class="grow"></span><span>'+esc(money(m.cost,"USD"))+'</span><span class="muted right" style="min-width:74px">'+m.requests+' '+esc(S().req)+(m.errors?(' · <span style="color:#f87171">'+m.errors+' '+esc(S().err)+'</span>'):'')+'</span></div>';
+        });
+      }
+    }
+    h+='</div>';
+    // 3. codeg 用量
+    var cu=src["codeg-usage"];
+    h+='<div class="card"><h2>'+esc(S().codegUsage)+'</h2>';
+    if(!cu)h+='<div class="muted">'+esc(S().noData)+'</div>';
+    else{
+      if(cu.stale)h+='<div class="small" style="color:#eab308">'+esc(S().stale)+'</div>';
+      var ty=(cu.totals||{}).today||{},d30=(cu.totals||{}).d30||{};
+      h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+toks(ty.totalTokens)+" · "+ty.turns+" "+esc(S().turns)
+        +" &nbsp; <span class='muted'>"+esc(S().d30)+"</span> "+toks(d30.totalTokens)+" · "+d30.turns+" "+esc(S().turns)
+        +"<br><span class='muted'>"+esc(S().cache)+"</span> "+toks(ty.cacheReadTokens)+"</div>";
+      var days=(cu.series||[]).map(function(s){return s.tokens;});
+      if(days.length>1)h+=spark(days);
+      if((cu.byModel||[]).length){
+        h+='<hr><div class="small muted">'+esc(S().byModel)+'</div>';
+        cu.byModel.slice(0,6).forEach(function(m){
+          h+='<div class="row small"><span style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(m.key)+'</span><span class="grow"></span><span>'+toks(m.tokens)+'</span><span class="muted right" style="min-width:60px">'+m.turns+' '+esc(S().turns)+'</span></div>';
+        });
+      }
+      if((cu.byAgent||[]).length){
+        h+='<hr><div class="small muted">'+esc(S().byAgent)+'</div>';
+        cu.byAgent.slice(0,5).forEach(function(a){
+          h+='<div class="row small"><span style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.key)+'</span><span class="grow"></span><span>'+toks(a.tokens)+'</span><span class="muted right" style="min-width:60px">'+a.turns+' '+esc(S().turns)+'</span></div>';
+        });
+      }
+    }
+    h+='</div>';
+    app.innerHTML=h;
+    var f=(acct._fetchedAt?new Date(Date.parse(acct._fetchedAt)):null);
+    document.getElementById("stamp").textContent=f?(S().upd+" "+pad(f.getHours())+":"+pad(f.getMinutes())):"";
+  }
+  function showErr(e){
+    var app=document.getElementById("app");
+    if(app) app.innerHTML='<div class="muted small" style="white-space:pre-wrap">'+esc(String((e&&(e.stack||e.message))||e).slice(0,500))+'</div>';
+  }
+  window.addEventListener("error",function(ev){showErr(ev.error||ev.message);});
+  function refresh(){
+    var jobs=[get(JSON_URL).then(function(d){state.accounts=d;}).catch(function(){}),
+              get(SRC_URL).then(function(d){state.sources=d;}).catch(function(){}),
+              fetch(HIST_URL+"?t="+Date.now(),{cache:"no-store"}).then(function(r){return r.ok?r.text():"";}).then(function(txt){
+                var out=[];(txt||"").split("\n").forEach(function(ln){ln=ln.trim();if(!ln)return;try{var o=JSON.parse(ln);if(o&&o.t)out.push(o);}catch(e){}});state.hist=out.slice(-1500);
+              }).catch(function(){})];
+    return Promise.all(jobs).then(render).catch(showErr);
+  }
+  document.getElementById("rf").addEventListener("click",refresh);
+  refresh();
+  setInterval(refresh,POLL);
+})();
+</script>
+</body>
+</html>
