@@ -16,7 +16,8 @@ rm -f /usr/local/bin/codeg-opencode-quota-updater \
       /usr/local/bin/codeg-opencode-quota-api \
       /usr/local/bin/codeg-opencode-quota-patch \
       "$WEB_DIR/opencode-quota.js" \
-      "$WEB_DIR/opencode-quota.json"
+      "$WEB_DIR/opencode-quota.json" \
+      "$WEB_DIR/opencode-quota-history.jsonl"
 rm -rf /usr/local/share/codeg-opencode-quota
 
 echo "==> 清理 html 注入标签"

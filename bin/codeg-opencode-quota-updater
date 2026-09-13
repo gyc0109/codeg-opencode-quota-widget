@@ -5,6 +5,8 @@ import json, os, re, sys, time, urllib.request, urllib.error, pathlib
 ACCOUNTS_FILE = "/root/.config/opencode/quota-accounts.json"
 FALLBACK_CONFIG = "/root/.config/opencode/opencode.jsonc"
 OUT = os.environ.get("CODEG_STATIC_DIR", "/usr/local/share/codeg/web") + "/opencode-quota.json"
+HISTORY = os.environ.get("CODEG_STATIC_DIR", "/usr/local/share/codeg/web") + "/opencode-quota-history.jsonl"
+HISTORY_KEEP = 1500  # 约 25 小时（60s 间隔）
 URL = "https://opencode.ai/zen/go/v1/usage"
 INTERVAL = int(os.environ.get("OPENCODE_QUOTA_INTERVAL", "60"))
 
@@ -59,8 +61,29 @@ def once():
     tmp = OUT + ".tmp"
     pathlib.Path(tmp).write_text(json.dumps(out, ensure_ascii=False))
     os.replace(tmp, OUT)
+    append_history(out["accounts"])
     print(f"opencode-quota: ok={ok} fail={fail} accounts={len(acc)}", flush=True)
     return fail == 0 or ok > 0
+
+def append_history(accounts):
+    """用量快照 append 到 jsonl，供前端画 24h 曲线；超长截尾。"""
+    try:
+        line = {"t": int(time.time()), "a": [
+            {"n": a.get("name", "?"),
+             "r": (a.get("usage") or {}).get("rolling", {}).get("percent"),
+             "w": (a.get("usage") or {}).get("weekly", {}).get("percent"),
+             "m": (a.get("usage") or {}).get("monthly", {}).get("percent")}
+            for a in accounts]}
+        with open(HISTORY, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+        # 截尾（顺手做，不必每轮精确）
+        with open(HISTORY, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > HISTORY_KEEP + 200:
+            with open(HISTORY, "w", encoding="utf-8") as f:
+                f.writelines(lines[-HISTORY_KEEP:])
+    except OSError as e:
+        print(f"opencode-quota: history write failed: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     if "--once" in sys.argv:

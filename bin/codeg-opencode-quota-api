@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """codeg-opencode-quota 管理接口（sidecar，供前端读写 quota-accounts.json）.
 
-监听 127.0.0.1:3081 + 对外端口（见 service 文件），鉴权：请求头 X-Codeg-Token
+监听 0.0.0.0:3081（见 service 文件），鉴权：请求头 X-Codeg-Token
 必须等于 /etc/codeg.env 里的 CODEG_TOKEN。完整 key 永不外泄，只返回脱敏前缀。
 """
 import json, os, re, subprocess, sys, urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 ACCOUNTS_FILE = "/root/.config/opencode/quota-accounts.json"
@@ -82,10 +82,8 @@ class H(BaseHTTPRequestHandler):
     def _authed(self):
         if not CODEG_TOKEN:
             return True  # 未配置 token 时放行（本机可信环境兜底）
-        got = self.headers.get("X-Codeg-Token", "")
-        if not got:
-            got = parse_qs(urlparse(self.path).query).get("token", [""])[0]
-        return got == CODEG_TOKEN
+        # 只认请求头，不接受 ?token=（query 会进访问日志）
+        return self.headers.get("X-Codeg-Token", "") == CODEG_TOKEN
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -151,6 +149,6 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not CODEG_TOKEN:
         print("quota-api: WARNING no CODEG_TOKEN found, auth disabled", file=sys.stderr)
-    httpd = HTTPServer(("0.0.0.0", PORT), H)
+    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(f"quota-api: listening on :{PORT}", flush=True)
     httpd.serve_forever()
