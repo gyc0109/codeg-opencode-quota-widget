@@ -7,7 +7,11 @@ collect() 的异常由调用方兜底（保留上次数据并标 stale），源�
 import datetime
 import json
 import pathlib
+import sys
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import _codeg_quota_common as common  # noqa: E402
 
 
 def now_iso():
@@ -25,9 +29,6 @@ class SourceAdapter:
     source_id = ""
     display_name = {}
     default_interval_s = 60
-
-    def available(self):
-        return True
 
     def collect(self, prev):
         """-> 数据块 dict；失败抛异常（调用方保留 prev 并标 stale）。"""
@@ -48,9 +49,6 @@ class CCSwitchSource(SourceAdapter):
         if env:
             return pathlib.Path(env)
         return pathlib.Path.home() / ".cc-switch/cc-switch.db"
-
-    def available(self):
-        return self.db_path().is_file()
 
     def _connect(self):
         import sqlite3
@@ -101,22 +99,24 @@ class CCSwitchSource(SourceAdapter):
             health = q(
                 "SELECT h.provider_id, h.app_type, h.is_healthy, h.consecutive_failures, "
                 "COALESCE(h.last_error,''), COALESCE(h.last_success_at,''), COALESCE(p.name,'') "
-                "FROM provider_health h LEFT JOIN providers p ON p.id = h.provider_id")
+                "FROM provider_health h LEFT JOIN providers p "
+                "ON p.id = h.provider_id AND p.app_type = h.app_type")
             limits = q(
                 "SELECT id, app_type, COALESCE(name,''), limit_daily_usd, limit_monthly_usd "
                 "FROM providers WHERE limit_daily_usd IS NOT NULL OR limit_monthly_usd IS NOT NULL")
             per = q(
-                "SELECT provider_id, "
+                "SELECT provider_id, app_type, "
                 "COALESCE(sum(CASE WHEN created_at >= ? THEN CAST(total_cost_usd AS REAL) END),0), "
                 "COALESCE(sum(CASE WHEN created_at >= ? THEN CAST(total_cost_usd AS REAL) END),0) "
-                "FROM proxy_request_logs GROUP BY provider_id", (today, month))
+                "FROM proxy_request_logs WHERE created_at >= ? "
+                "GROUP BY provider_id, app_type", (today, month, month))
         finally:
             con.close()
-        per_map = dict((r[0], (r[1], r[2])) for r in per)
+        per_map = dict(((r[0], r[1]), (r[2], r[3])) for r in per)
 
         lim_out = []
         for pid, app, name, dl, ml in limits:
-            spent_t, spent_m = per_map.get(pid, (0.0, 0.0))
+            spent_t, spent_m = per_map.get((pid, app), (0.0, 0.0))
             if dl is not None and _f(dl) > 0:
                 lim_out.append({"providerId": pid, "app": app, "name": name or pid[:8],
                                 "window": "daily", "kind": "budget",
@@ -133,7 +133,6 @@ class CCSwitchSource(SourceAdapter):
 
         return {
             "fetchedAt": now_iso(), "ok": True, "stale": False,
-            "db": str(self.db_path()),
             "day": now.strftime("%Y-%m-%d"),
             "totals": {
                 "today": {"requests": int(t_req or 0), "errors": int(t_err or 0),
@@ -161,12 +160,6 @@ class CodegUsageSource(SourceAdapter):
     default_interval_s = 300
 
     def _service(self):
-        import os
-        sys_path = pathlib.Path(__file__).resolve().parent
-        import sys
-        if str(sys_path) not in sys.path:
-            sys.path.insert(0, str(sys_path))
-        import _codeg_quota_common as common
         port, token = common.read_codeg_service()
         if port and token:
             return port, token
@@ -182,9 +175,6 @@ class CodegUsageSource(SourceAdapter):
         except Exception:
             pass
         return None, None
-
-    def available(self):
-        return self._service()[0] is not None
 
     def _post(self, port, token, cmd, body):
         import urllib.request
@@ -232,7 +222,7 @@ class CodegUsageSource(SourceAdapter):
                     "conversations": int(t.get("conversation_count") or 0)}
 
         return {
-            "fetchedAt": now_iso(), "ok": True, "stale": False, "port": port,
+            "fetchedAt": now_iso(), "ok": True, "stale": False,
             "totals": {"today": totals(today), "d30": totals(d30.get("totals") or {})},
             "series": [{"day": s.get("bucket_key"), "tokens": int(s.get("total_tokens") or 0),
                         "turns": int(s.get("turn_count") or 0)}
@@ -264,8 +254,6 @@ def refresh_sources(prev_doc, only_ids=None):
             continue
         prev_block = prev_sources.get(sid)
         try:
-            if not src.available():
-                raise RuntimeError("not available")
             out[sid] = src.collect(prev_block)
         except Exception as e:
             old = dict(prev_block or {})

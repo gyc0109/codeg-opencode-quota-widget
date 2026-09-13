@@ -23,6 +23,7 @@ LEGACY_KEYS = {"rolling": "r", "weekly": "w", "monthly": "m"}
 BURN_SPAN_MAX_H = 3.0     # 燃烧率只用最近 3 小时样本
 BURN_MIN_SPAN_H = 0.25    # 至少 15 分钟跨度
 BURN_MIN_SAMPLES = 5
+RESET_DROP_PCT = 10.0     # used 方向：相邻样本下降超过该值视为窗口重置（充值同理）
 INTERVAL_OVERRIDE = common.safe_int("OPENCODE_QUOTA_INTERVAL", 0, minimum=5) or None
 
 
@@ -87,9 +88,25 @@ def series_for(history, provider, name, win_id, legacy_key=None):
 
 
 def burn_rate(pts, kind, direction):
-    """-> {"perHour": x, "runOutAt": iso|None} 或 None（样本不足）。"""
+    """-> {"perHour": x, "runOutAt": iso|None} 或 None（样本不足）。
+
+    只取「最后一次重置/充值跳变」之后的样本，否则跨越 5h 重置点的斜率为负，
+    会错误显示为"暂无耗尽趋势"。
+    """
     now = time.time()
     recent = [(t, v) for t, v in pts if 0 <= now - t <= BURN_SPAN_MAX_H * 3600]
+    if len(recent) < BURN_MIN_SAMPLES:
+        return None
+    cut = 0
+    for i in range(1, len(recent)):
+        prev, cur = recent[i - 1][1], recent[i][1]
+        if direction == "used":
+            if cur < prev - RESET_DROP_PCT:
+                cut = i
+        else:
+            if cur > prev + max(RESET_DROP_PCT, abs(prev) * 0.2):
+                cut = i
+    recent = recent[cut:]
     if len(recent) < BURN_MIN_SAMPLES:
         return None
     t0, v0 = recent[0]
@@ -179,21 +196,26 @@ def load_prev_accounts():
 
 def refresh(only_types=None, dry_run=False, tick=0):
     cfg = common.load_config()
+    order = [p.get("type") for p in cfg.get("providers", []) if isinstance(p, dict)]
+    # 本轮参与刷新的 provider 类型（按配置算，而不是按产出算）：
+    # 段落清空（accounts: []）时其旧条目必须被丢弃，不能沿用
+    refreshed_types = set(only_types) if only_types is not None else set(order)
     prev_entries = load_prev_accounts()
     prev_by_key = {}
     for e in prev_entries:
         prev_by_key[(e.get("provider") or common.DEFAULT_PROVIDER, e.get("name"))] = e
     fetched = providers.build_account_entries(cfg, only_types, prev_by_key)
-    fetched_types = set(e.get("provider") for e in fetched)
-    order = [p.get("type") for p in cfg.get("providers", [])]
-    # 本轮未刷新的 provider 沿用上次输出；旧格式条目（无 provider 字段）视为默认 provider
+    # 未刷新且仍在配置中的 provider 沿用上次输出；旧格式条目（无 provider 字段）视为默认 provider
     kept = []
     for e in prev_entries:
         p = e.get("provider") or common.DEFAULT_PROVIDER
-        if p in fetched_types or p not in order:
+        if p in refreshed_types or p not in order:
             continue
         e["provider"] = p
         kept.append(e)
+    entries = kept + fetched
+    entries.sort(key=lambda e: order.index(e.get("provider"))
+                 if e.get("provider") in order else 999)
     entries = kept + fetched
     entries.sort(key=lambda e: order.index(e.get("provider"))
                  if e.get("provider") in order else 999)
@@ -252,6 +274,8 @@ def due_types(last_run):
     cfg = common.load_config()
     due = set()
     for prov in cfg.get("providers", []):
+        if not isinstance(prov, dict):
+            continue
         ptype = prov.get("type")
         adapter = providers.get_adapter(ptype)
         interval = INTERVAL_OVERRIDE or (adapter.default_interval_s if adapter else 60)

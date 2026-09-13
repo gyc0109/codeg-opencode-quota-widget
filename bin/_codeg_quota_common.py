@@ -107,19 +107,31 @@ def _parse_config_text(text):
     return None
 
 
+def _fallback_config():
+    acc = _fallback_keys()
+    provs = [{"type": DEFAULT_PROVIDER,
+              "accounts": [{"name": n, "apiKey": k} for n, k in acc],
+              "options": {}}] if acc else []
+    return {"version": 2, "providers": provs}
+
+
 def load_config():
-    """读配置（v1 自动升级为内存 v2）。文件缺失/损坏返回空配置（不回退 key 文件）。"""
+    """读配置（v1 自动升级为内存 v2）。
+
+    文件缺失/损坏时回退到 key 文件（与 load_accounts 语义一致）；
+    文件存在且可解析时以其为准（空 providers 就是空，不回退）。
+    """
     f = accounts_file()
     if not f.exists():
-        return {"version": 2, "providers": []}
+        return _fallback_config()
     try:
         cfg = _parse_config_text(f.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
-        return {"version": 2, "providers": []}
+        return _fallback_config()
     if cfg is None:
         print("opencode-quota: accounts file has unknown shape", file=sys.stderr)
-        return {"version": 2, "providers": []}
+        return _fallback_config()
     return cfg
 
 

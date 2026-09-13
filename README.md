@@ -67,7 +67,7 @@ sudo ./install.sh
 
 ```bash
 ./install.sh                  # 基础：额度抓取 + 本机账号接口（launchd 常驻）
-./install.sh --browser        # + 浏览器模式：把打补丁的 web UI 挂到本机 :3080
+./install.sh --browser        # + 浏览器模式：把打补丁的 web UI 挂到本机 :3085
 ./install.sh --desktop-tweak  # + 桌面版注入：codeg.app 窗口内直接显示药丸（实验性，见下）
 ```
 
@@ -121,7 +121,7 @@ dylib 注入（`WKWebView` userScript 注入前端脚本）：
 
 ## 端口
 
-- `:3080` codeg 本体（Linux 服务端 / macOS 浏览器模式的独立 server）；额度数据可经 `:3081/quota.json` 读取
+- `:3085` macOS 浏览器模式的独立 server（Linux 服务端为本机 codeg 自带的 :3080）；额度数据可经 `:3081/quota.json` 读取
 - `:3081` 账号管理接口（增删账号 + 额度数据只读转发）。macOS 仅监听 `127.0.0.1`；Linux 默认监听 `0.0.0.0`（可用 `OPENCODE_QUOTA_API_HOST` 收紧）。浏览器需能访问该端口，否则网页内添加账号会报网络错，改文件方式不受影响
 
 ## 数据流

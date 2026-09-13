@@ -7,7 +7,8 @@ usage() {
 用法:
   Linux : sudo ./install.sh
   macOS : ./install.sh [--browser] [--desktop-tweak]
-    --browser        额外安装"浏览器模式"：本机/局域网 :3080 提供打补丁的 codeg web UI（launchd 常驻）
+    --browser        额外安装"浏览器模式"：本机/局域网 :3085 提供打补丁的 codeg web UI（launchd 常驻，
+                     端口可用 CODEG_QUOTA_SERVER_PORT 覆盖）
     --desktop-tweak  额外给 codeg.app 桌面版注入额度药丸（dylib + ad-hoc 重签，见 README 风险说明）
 EOF
 }
@@ -88,7 +89,7 @@ install_macos() {
   mkdir -p "$LIB/bin" "$LOGDIR" "$AGENTS"
 
   echo "==> 安装脚本与前端母本"
-  cp "$SRC/bin/"* "$LIB/bin/"
+  find "$SRC/bin" -maxdepth 1 -type f -exec cp {} "$LIB/bin/" \;
   chmod +x "$LIB/bin/codeg-opencode-quota-"*
   cp "$SRC/web/opencode-quota.js" "$LIB/opencode-quota.js"
   cp "$SRC/web/quota.html" "$LIB/quota.html"
@@ -130,7 +131,7 @@ install_macos() {
                    "s|@@CODEG_SERVER@@|$(esc "$SERVER_BIN")|g" \
                    "s|@@WEBROOT@@|$(esc "$WEBROOT")|g" \
                    "s|@@TOKEN@@|$TOKEN|g" \
-                   "s|@@SERVERPORT@@|$SERVER_PORT|g"
+                   "s|@@SERVERPORT@@|$(esc "$SERVER_PORT")|g"
       chmod 600 "$SERVER_PLIST"
       bootstrap_agent app.codeg.opencode-quota.server "$SERVER_PLIST"
       # repair agent 同时负责 codeg 升级后刷新 web 副本（未装桌面注入时只做这件事）
@@ -195,7 +196,7 @@ install_linux() {
   cp "$SRC/web/opencode-quota.js" "$WEB_DIR/opencode-quota.js"
   cp "$SRC/web/quota.html" "$LIB/quota.html"
   cp "$SRC/web/quota.html" "$WEB_DIR/quota.html"
-  cp "$SRC/bin/"* /usr/local/bin/
+  find "$SRC/bin" -maxdepth 1 -type f -exec cp {} /usr/local/bin/ \;
   rm -f /usr/local/bin/codeg-opencode-quota-repair   # macOS 专用
   chmod +x /usr/local/bin/codeg-opencode-quota-updater \
            /usr/local/bin/codeg-opencode-quota-api \

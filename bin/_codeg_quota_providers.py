@@ -59,7 +59,8 @@ class KeyAdapter:
     def _window(self, spec, **values):
         w = {"id": spec.id, "label": spec.label, "kind": spec.kind,
              "direction": spec.direction, "primary": spec.primary,
-             "resetsAt": values.pop("resetsAt", None), "alert": spec.alert}
+             "resetsAt": values.pop("resetsAt", None), "alert": spec.alert,
+             "pill": spec.pill, "resets": spec.resets}
         w.update(values)
         return w
 
@@ -186,6 +187,8 @@ def build_account_entries(providers_cfg, only_types=None, prev_by_key=None):
     """
     entries = []
     for prov in providers_cfg.get("providers", []):
+        if not isinstance(prov, dict):
+            continue
         ptype = prov.get("type") or ""
         if only_types is not None and ptype not in only_types:
             continue

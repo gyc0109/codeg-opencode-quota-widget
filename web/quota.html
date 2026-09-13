@@ -82,10 +82,31 @@
     var tail=w.burn.runOutAt?S().drainOut(cd(w.burn.runOutAt)):S().noTrend;
     return '<div class="burn">'+esc(tx)+' · '+esc(tail)+'</div>';
   }
+  var LEGACY_SPECS=[
+    {id:"rolling",label:{zh:"5小时",en:"5-hour"},primary:true},
+    {id:"weekly",label:{zh:"每周",en:"Weekly"}},
+    {id:"monthly",label:{zh:"每月",en:"Monthly"}}
+  ];
+  // 窗口取数：新格式 windows 优先，旧格式 usage 兜底（与药丸一致）
+  function windowsOf(a){
+    if(!a) return [];
+    if(a.windows&&a.windows.length) return a.windows;
+    if(a.usage){
+      var out=[];
+      LEGACY_SPECS.forEach(function(s){
+        var d=a.usage[s.id];
+        if(!d) return;
+        out.push({id:s.id,label:s.label,primary:s.primary,kind:"percent",direction:"used",
+                  percent:d.percent,resetsAt:d.resetsAt});
+      });
+      return out;
+    }
+    return [];
+  }
   function winRow(w){
-    var pct=w.kind==="percent"?w.percent:((w.kind==="budget"&&w.limit)?Math.round(w.value/w.limit*100):null);
+    var pct=w.kind==="percent"?(Number(w.percent)||0):((w.kind==="budget"&&w.limit)?Math.round(w.value/w.limit*100):null);
     var bar=pct!=null?'<span class="bar"><i style="width:'+Math.min(100,Math.max(0,pct))+'%;background:'+color(pct)+'"></i></span>':'<span class="bar" style="visibility:hidden"></span>';
-    var val=w.kind==="percent"?'<b>'+(LANG==="zh"?(100-w.percent)+"% "+S().left:w.percent+"% "+S().used)+'</b>'
+    var val=w.kind==="percent"?'<b>'+(100-pct)+"% "+S().left+'</b>'
       :'<b>'+esc(money(w.value,w.unit))+'</b>'+(w.limit!=null?' <span class="muted">/ '+esc(money(w.limit,w.unit))+'</span>':'');
     var reset=w.resetsAt?('<span class="muted small right">'+esc(fdate(w.resetsAt))+'<br>'+esc(cd(w.resetsAt))+'</span>'):'';
     return '<div style="border-top:1px solid rgba(127,127,127,.14)"><div class="row"><span class="lbl">'+esc(L(w.label))+'</span>'+bar+'<span style="min-width:88px" class="right">'+val+'</span><span class="grow"></span>'+reset+'</div>'+burnLine(w)+'</div>';
@@ -101,7 +122,7 @@
     var list=acct.accounts||[];
     if(!list.length)h+='<div class="muted">'+esc(S().noData)+'</div>';
     list.forEach(function(a){
-      var ws=a.windows||[];
+      var ws=windowsOf(a);
       h+='<div style="margin-bottom:6px"><b>'+esc(a.name||"")+'</b> <span class="muted">'+esc(a.provider||"")+'</span>'
         +(a.stale?' <span class="small" style="color:#eab308">⚠ '+esc(S().acctStale)+'</span>':'')+'</div>';
       if(a.error&&!ws.length){h+='<div class="small" style="color:#f87171">'+fmtErr(a.error)+'</div>';return;}
@@ -119,11 +140,14 @@
     if(!cs)h+='<div class="muted">'+esc(S().noData)+'</div>';
     else{
       if(cs.stale)h+='<div class="small" style="color:#eab308">'+esc(S().stale)+'</div>';
+      if(cs.error&&!cs.totals)h+='<div class="small muted">'+fmtErr(cs.error)+'</div>';
       var td=(cs.totals||{}).today||{},hr=(cs.totals||{}).hour||{},mo=(cs.totals||{}).month||{};
-      h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+td.requests+" "+esc(S().req)+" · "+td.errors+" "+esc(S().err)+" ("+Math.round((td.errorRate||0)*100)+"%)"
-        +" &nbsp; <span class='muted'>"+esc(S().cost)+"</span> "+esc(money(td.cost,"USD"))+" · "+esc(S().month)+" "+esc(money(mo.cost,"USD"))
-        +"<br><span class='muted'>"+esc(S().hour)+"</span> "+hr.requests+" "+esc(S().req)+" · "+hr.errors+" "+esc(S().err)+"</div>";
-      (cs.limits||[]).forEach(function(l){h+=winRow({kind:"budget",label:{zh:l.window==="daily"?S().dailyLimit:S().monthlyLimit,en:l.window==="daily"?S().dailyLimit:S().monthlyLimit},value:l.value,limit:l.limit,unit:l.unit});});
+      if((cs.totals||{}).today){
+        h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+td.requests+" "+esc(S().req)+" · "+td.errors+" "+esc(S().err)+" ("+Math.round((td.errorRate||0)*100)+"%)"
+          +" &nbsp; <span class='muted'>"+esc(S().cost)+"</span> "+esc(money(td.cost,"USD"))+" · "+esc(S().month)+" "+esc(money(mo.cost,"USD"))
+          +"<br><span class='muted'>"+esc(S().hour)+"</span> "+hr.requests+" "+esc(S().req)+" · "+hr.errors+" "+esc(S().err)+"</div>";
+      }
+      (cs.limits||[]).forEach(function(l){h+=winRow({kind:"budget",label:(l.window==="daily"?S().dailyLimit:S().monthlyLimit),value:l.value,limit:l.limit,unit:l.unit});});
       if((cs.health||[]).length){
         h+='<hr>';
         cs.health.forEach(function(x){
@@ -145,10 +169,13 @@
     if(!cu)h+='<div class="muted">'+esc(S().noData)+'</div>';
     else{
       if(cu.stale)h+='<div class="small" style="color:#eab308">'+esc(S().stale)+'</div>';
+      if(cu.error&&!cu.totals)h+='<div class="small muted">'+fmtErr(cu.error)+'</div>';
       var ty=(cu.totals||{}).today||{},d30=(cu.totals||{}).d30||{};
-      h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+toks(ty.totalTokens)+" · "+ty.turns+" "+esc(S().turns)
-        +" &nbsp; <span class='muted'>"+esc(S().d30)+"</span> "+toks(d30.totalTokens)+" · "+d30.turns+" "+esc(S().turns)
-        +"<br><span class='muted'>"+esc(S().cache)+"</span> "+toks(ty.cacheReadTokens)+"</div>";
+      if((cu.totals||{}).today){
+        h+='<div class="small"><span class="muted">'+esc(S().today)+'</span> '+toks(ty.totalTokens)+" · "+ty.turns+" "+esc(S().turns)
+          +" &nbsp; <span class='muted'>"+esc(S().d30)+"</span> "+toks(d30.totalTokens)+" · "+d30.turns+" "+esc(S().turns)
+          +"<br><span class='muted'>"+esc(S().cache)+"</span> "+toks(ty.cacheReadTokens)+"</div>";
+      }
       var days=(cu.series||[]).map(function(s){return s.tokens;});
       if(days.length>1)h+=spark(days);
       if((cu.byModel||[]).length){

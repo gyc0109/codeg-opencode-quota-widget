@@ -138,6 +138,16 @@ class H(BaseHTTPRequestHandler):
             return self.headers.get("X-Codeg-Token", "") == CODEG_TOKEN
         return self._origin_ok()
 
+    def _authed_data(self):
+        """只读数据端点：配了 token 时也放行本机/桌面壳/null 来源。
+
+        数据与浏览器模式公开的静态文件等价（沙箱 HTML 预览页无法携带 token）。
+        账号管理接口仍走严格 _authed()。
+        """
+        if not CODEG_TOKEN:
+            return self._origin_ok()
+        return (self.headers.get("X-Codeg-Token", "") == CODEG_TOKEN) or self._origin_ok()
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -145,8 +155,14 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if not self._authed():
-            return self._send(401, {"error": "unauthorized"})
+        if path in ("/quota.json", "/quota-history.jsonl", "/quota-sources.json"):
+            if not self._authed_data():
+                return self._send(401, {"error": "unauthorized"})
+        elif path == "/api/accounts":
+            if not self._authed():
+                return self._send(401, {"error": "unauthorized"})
+        else:
+            return self._send(404, {"error": "not found"})
         if path == "/quota.json":
             body = local_file("opencode-quota.json")
             if body is None:
@@ -160,8 +176,6 @@ class H(BaseHTTPRequestHandler):
             if body is None:
                 return self._send(404, {"error": "no sources data yet"})
             return self._send_raw(200, body, "application/json; charset=utf-8")
-        if path != "/api/accounts":
-            return self._send(404, {"error": "not found"})
         provider = (parse_qs(urlparse(self.path).query).get("provider")
                     or [common.DEFAULT_PROVIDER])[0].strip() or common.DEFAULT_PROVIDER
         acc = common.load_accounts(provider)

@@ -157,8 +157,11 @@
   function accountsOf(data, provider){
     return ((data&&data.accounts)||[]).filter(function(a){ return providerOf(a)===provider; });
   }
-  var PROVIDER_NAMES={ "opencode-go":"OpenCode Go", "deepseek":"DeepSeek" };
+  var PROVIDER_NAMES={ "opencode-go":"OpenCode Go", "deepseek":"DeepSeek", "openrouter":"OpenRouter" };
   function providerName(p){ return PROVIDER_NAMES[p]||p; }
+  var KNOWN_PROVIDERS=["opencode-go","deepseek","openrouter"];  // 与 _codeg_quota_providers.ADAPTERS 对应
+  var STALE_MIN=6;  // 数据年龄超此分钟数视为过期（余额类 provider 本身 300s 一抓）
+  var ALERT_PREFIX="oq-alerted-";
   var LEGACY_SPECS=[
     {id:"rolling",label:{zh:"5小时",en:"5-hour"},primary:true,alert:{pct:[80]}},
     {id:"weekly",label:{zh:"每周",en:"Weekly"},alert:{pct:[90]}},
@@ -264,12 +267,15 @@
     for(var i=0;i<alerts.length;i++){
       var al=alerts[i];
       seen[al.key]=1;
-      if(localStorage.getItem("oq-alerted-"+al.key)) continue;
-      if(localStorage.getItem("opencode-quota-alerted-"+al.name)){
-        localStorage.setItem("oq-alerted-"+al.key,"1");
+      if(localStorage.getItem(ALERT_PREFIX+al.key)) continue;
+      var legacyKey="opencode-quota-alerted-"+al.name;
+      if(al.name&&localStorage.getItem(legacyKey)){
+        // 老版本 key 迁移：种下新 key 后立即删除老 key（否则该账号通知被永久压制）
+        localStorage.setItem(ALERT_PREFIX+al.key,"1");
+        try{ localStorage.removeItem(legacyKey); }catch(e){}
         continue;
       }
-      localStorage.setItem("oq-alerted-"+al.key,"1");
+      localStorage.setItem(ALERT_PREFIX+al.key,"1");
       var body="";
       if(al.kind==="pct") body=t.alertPct(al.name||providerName(al.provider), al.win, al.pct);
       else if(al.kind==="below") body=t.alertBelow(al.name||providerName(al.provider), fmtMoney(al.value,al.unit));
@@ -280,13 +286,18 @@
         if("Notification" in window && Notification.permission==="granted"){ new Notification(t.alert,{body:body}); }
       }catch(e){}
     }
+    // 只在数据权威（含账号清单）时清理已恢复的 key——
+    // fetchDirect 降级数据没有 accounts，横扫会误删全部 key 造成重复通知
     try{
-      var rm=[];
-      for(var n=0;n<localStorage.length;n++){
-        var lk=localStorage.key(n);
-        if(lk && lk.indexOf("oq-alerted-")===0 && !seen[lk.slice(11)]) rm.push(lk);
+      var authoritative=!!((data&&data.accounts&&data.accounts.length));
+      if(authoritative){
+        var rm=[];
+        for(var n=0;n<localStorage.length;n++){
+          var lk=localStorage.key(n);
+          if(lk && lk.indexOf(ALERT_PREFIX)===0 && !seen[lk.slice(ALERT_PREFIX.length)]) rm.push(lk);
+        }
+        rm.forEach(function(x){ localStorage.removeItem(x); });
       }
-      rm.forEach(function(x){ localStorage.removeItem(x); });
     }catch(e2){}
     if(alerts.length) quotaEl.classList.add("oq-alert");
     else quotaEl.classList.remove("oq-alert");
@@ -315,9 +326,9 @@
     el.addEventListener("click", function(e){
       e.stopPropagation();
       if(isFolded()){ localStorage.setItem(LS_FOLD,"0"); applyFold(); render(cache); return; }
-      // 用户手势里顺便申请通知权限（仅当有告警，避免打扰）
+      // 用户手势里顺便申请通知权限（仅当有告警——含数据源告警，避免打扰）
       try{
-        if(collectAlerts(cache).length
+        if(collectAlerts(cache).concat(collectSourceAlerts()).length
            &&"Notification" in window&&Notification.permission==="default"){ Notification.requestPermission().catch(function(){}); }
       }catch(err){}
       togglePopup();
@@ -339,6 +350,7 @@
 
   function numLine(p, mode){
     var t=S();
+    p=Number(p)||0;
     if(mode==="used") return "<b>"+p+"%</b> "+t.used;
     return "<b>"+(100-p)+"%</b> "+t.left;
   }
@@ -351,7 +363,7 @@
     var providers=providerList(data);
     if(!providers.length){
       var a0=pickAccount(data);
-      if(!a0||!hasData(a0)){ inner.textContent="—"; return; }
+      if(!a0||!hasData(a0)){ inner.textContent="—"; applyAlerts(data); return; }
       providers=["opencode-go"];
     }
     var mode=getMode(), parts=[], titleLines=[];
@@ -363,7 +375,8 @@
         var w=ws[j];
         if(w.pill===false) continue;
         if(w.kind==="percent"&&w.percent!=null){
-          segs.push(dot(w.percent)+'<span style="opacity:.6">'+esc(shortLabel(w))+'</span> <b>'+(mode==="used"?w.percent:(100-w.percent))+'%</b>');
+          var wp=Number(w.percent)||0;
+          segs.push(dot(wp)+'<span style="opacity:.6">'+esc(shortLabel(w))+'</span> <b>'+(mode==="used"?wp:(100-wp))+'%</b>');
           shown++;
         } else if((w.kind==="money"||w.kind==="budget")&&w.value!=null){
           segs.push('<span style="opacity:.6">'+esc(shortLabel(w))+'</span> <b>'+esc(fmtMoney(w.value,w.unit))+'</b>');
@@ -384,9 +397,9 @@
     inner.innerHTML=parts.join('<span style="opacity:.25;margin:0 6px">|</span>');
     Array.from(inner.querySelectorAll("b")).forEach(function(b){ b.style.fontWeight="600"; b.style.color="var(--foreground,#111)"; });
     var age=dataAgeMin();
-    // 数据过期（>3分钟）药丸变淡，悬停说明
-    quotaEl.style.opacity=(age!=null&&age>3)?".45":"";
-    quotaEl.title=titleLines.join("  ·  ")+" — "+t.openDetail+"，"+t.foldHint+(age!=null&&age>3?(" · "+t.stale(age)):"");
+    // 数据过期药丸变淡，悬停说明（阈值见 STALE_MIN）
+    quotaEl.style.opacity=(age!=null&&age>STALE_MIN)?".45":"";
+    quotaEl.title=titleLines.join("  ·  ")+" — "+t.openDetail+"，"+t.foldHint+(age!=null&&age>STALE_MIN?(" · "+t.stale(age)):"");
     applyAlerts(data);
     applyFold();
     if(popup && popup.style.display!=="none") renderPopup();
@@ -430,6 +443,9 @@
   }
   function rowHtml(label, w){
     var mode=getMode();
+    if(w.kind==="percent"&&w.percent==null) return "";
+    if(w.kind==="percent") w={ id:w.id,kind:w.kind,direction:w.direction,percent:Number(w.percent)||0,
+                               resetsAt:w.resetsAt,unit:w.unit,burn:w.burn,alert:w.alert,label:w.label };
     var pct=(w.kind==="percent")?w.percent:((w.kind==="budget"&&w.limit)?Math.round(w.value/w.limit*100):null);
     var bar=pct!=null?
       '<span style="display:inline-block;width:64px;height:5px;background:rgba(127,127,127,0.2);border-radius:99px;vertical-align:middle;overflow:hidden"><span style="display:block;width:'+Math.min(100,Math.max(0,pct))+'%;height:100%;background:'+colorFor(pct)+'"></span></span>'
@@ -490,13 +506,6 @@
   var SOURCE_NAMES={ "cc-switch":{zh:"CC Switch",en:"CC Switch"}, "codeg-usage":{zh:"codeg 用量",en:"codeg usage"} };
   function sourceName(sid){ var n=SOURCE_NAMES[sid]; return n?L(n):sid; }
   function sourceTabs(){ try{ return srcCache&&srcCache.sources?Object.keys(srcCache.sources):[]; }catch(e){ return []; } }
-  function srcAgeMin(){
-    try{
-      var f=srcCache&&srcCache._fetchedAt;
-      if(!f) return null;
-      return Math.max(0, Math.round((Date.now()-Date.parse(f))/60000));
-    }catch(e){ return null; }
-  }
   function healthSummary(){
     try{
       var b=srcCache&&srcCache.sources&&srcCache.sources["cc-switch"];
@@ -547,12 +556,15 @@
       s.addEventListener("click", function(e){ e.stopPropagation(); try{ localStorage.setItem(LS_PROVIDER, "src:"+s.getAttribute("data-src")); }catch(e2){} renderPopup(); });
     });
   }
-  function srcFooterHtml(){
-    var t=S(), age=srcAgeMin(), ageTxt="";
+  function srcFooterHtml(sid){
+    var t=S(), ageTxt="", age=null;
+    var b=(srcCache&&srcCache.sources&&srcCache.sources[sid])||{};
+    var ts=b.fetchedAt||(srcCache&&srcCache._fetchedAt);
     try{
-      if(srcCache&&srcCache._fetchedAt){ var d=new Date(Date.parse(srcCache._fetchedAt)); ageTxt=pad(d.getHours())+":"+pad(d.getMinutes()); }
+      if(ts){ var d=new Date(Date.parse(ts)); ageTxt=pad(d.getHours())+":"+pad(d.getMinutes());
+              age=Math.max(0,Math.round((Date.now()-Date.parse(ts))/60000)); }
     }catch(e){}
-    if(age!=null&&age>3) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
+    if(age!=null&&age>STALE_MIN) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
     return '<div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--muted-foreground,#71717a)">'
       +'<span style="flex:1"></span>'
       +'<span data-act="refresh" title="'+t.refresh+'" style="cursor:pointer;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;line-height:1">↻</span>'
@@ -568,11 +580,13 @@
     var sect='border-top:1px solid var(--border,rgba(0,0,0,0.06));margin-top:6px;padding-top:6px;font-size:11px';
     if(sid==="cc-switch"){
       var tt=b.totals||{}, td=tt.today||{}, hr=tt.hour||{}, mo=tt.month||{};
-      h+=statRowHtml([
-        [t.statToday, td.requests+" "+t.reqUnit+" · "+td.errors+" "+t.errUnit+" ("+Math.round((td.errorRate||0)*100)+"%)"],
-        [t.statCost, fmtMoney(td.cost,"USD")+" · "+t.monthWord+" "+fmtMoney(mo.cost,"USD")],
-        [t.statHour, hr.requests+" "+t.reqUnit+" · "+hr.errors+" "+t.errUnit]
-      ]);
+      if(tt.today){
+        h+=statRowHtml([
+          [t.statToday, td.requests+" "+t.reqUnit+" · "+td.errors+" "+t.errUnit+" ("+Math.round((td.errorRate||0)*100)+"%)"],
+          [t.statCost, fmtMoney(td.cost,"USD")+" · "+t.monthWord+" "+fmtMoney(mo.cost,"USD")],
+          [t.statHour, hr.requests+" "+t.reqUnit+" · "+hr.errors+" "+t.errUnit]
+        ]);
+      }
       (b.limits||[]).forEach(function(l){
         h+=rowHtml(l.window==="daily"?t.limitDaily:t.limitMonthly,
           {kind:"budget", value:l.value, limit:l.limit, unit:l.unit});
@@ -601,11 +615,13 @@
       }
     } else if(sid==="codeg-usage"){
       var ty=(b.totals||{}).today||{}, d30=(b.totals||{}).d30||{};
-      h+=statRowHtml([
-        [t.statToday, fmtTokens(ty.totalTokens)+" · "+ty.turns+" "+t.turnUnit],
-        [t.stat30d, fmtTokens(d30.totalTokens)+" · "+d30.turns+" "+t.turnUnit],
-        [t.statCache, fmtTokens(ty.cacheReadTokens)]
-      ]);
+      if((b.totals||{}).today){
+        h+=statRowHtml([
+          [t.statToday, fmtTokens(ty.totalTokens)+" · "+ty.turns+" "+t.turnUnit],
+          [t.stat30d, fmtTokens(d30.totalTokens)+" · "+d30.turns+" "+t.turnUnit],
+          [t.statCache, fmtTokens(ty.cacheReadTokens)]
+        ]);
+      }
       if((b.byModel||[]).length){
         h+='<div style="'+sect+'"><div style="opacity:.55;margin-bottom:2px">'+t.perModel+'</div>';
         b.byModel.slice(0,6).forEach(function(m){
@@ -668,9 +684,11 @@
     var tabNow="";
     try{ tabNow=localStorage.getItem(LS_PROVIDER)||""; }catch(e0){}
     var activeSrc=(tabNow.indexOf("src:")===0&&srcIds.indexOf(tabNow.slice(4))>=0)?tabNow.slice(4):null;
+    // 没有任何账号数据时，若有本地数据源则直接展示数据源（否则面板永远进不去）
+    if(!activeSrc && srcIds.length && !providerList(cache).length){ activeSrc=srcIds[0]; }
     if(activeSrc){
       popup.innerHTML=tabBarHtml(providerList(cache), srcIds, null, activeSrc)
-        +sourcePanelHtml(activeSrc)+srcFooterHtml();
+        +sourcePanelHtml(activeSrc)+srcFooterHtml(activeSrc);
       bindTabs();
       var rf0=popup.querySelector('[data-act="refresh"]');
       if(rf0) rf0.addEventListener("click", function(e){ e.stopPropagation(); refresh(); });
@@ -717,9 +735,14 @@
     } else {
       html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-weight:650">⚡ '+esc(acct&&acct.name?acct.name+" ":"")+'<span style="opacity:.45;font-weight:400">'+esc(providerName(activeP))+'</span></span><span style="flex:1"></span>'+addBtnHtml+'</div>';
     }
-    var provSelect=providers.length>1?('<select data-in="provider" style="width:100%;box-sizing:border-box;margin-bottom:6px;font-size:12px;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
-      +providers.map(function(p){ return '<option value="'+esc(p)+'"'+(p===activeP?' selected':'')+'>'+esc(providerName(p))+'</option>'; }).join("")
-      +'</select>'):"";
+    var provSelect=(function(){
+      var names=KNOWN_PROVIDERS.slice();
+      providers.forEach(function(p){ if(names.indexOf(p)<0) names.push(p); });
+      if(!names.length) return "";
+      return '<select data-in="provider" style="width:100%;box-sizing:border-box;margin-bottom:6px;font-size:12px;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
+        +names.map(function(p){ return '<option value="'+esc(p)+'"'+(p===activeP?' selected':'')+'>'+esc(providerName(p))+'</option>'; }).join("")
+        +'</select>';
+    })();
     html+='<div data-form="add" style="display:none;margin-bottom:8px;padding:8px;border:1px dashed var(--border,rgba(0,0,0,0.15));border-radius:8px">'
       +provSelect
       +'<input data-in="name" placeholder="'+esc(t.aliasPh)+'" maxlength="32" style="width:100%;box-sizing:border-box;margin-bottom:6px;font-size:12px;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
@@ -730,11 +753,11 @@
       +'<span data-act="add-save" style="cursor:pointer;font-size:11px;padding:2px 10px;border-radius:99px;background:var(--primary,#111);color:var(--primary-foreground,#fff)">'+t.save+'</span>'
       +'</div></div>';
     var ws=windowsOf(acct);
-    if(acct.error || !ws.length){ html+='<div style="color:#f87171">'+esc(noDataAcct(acct.error||"unknown"))+'</div>'; }
+    if(!ws.length){ html+='<div style="color:#f87171">'+esc(noDataAcct(acct.error||"unknown"))+'</div>'; }
     else{
-      ws.forEach(function(w){ if(w.kind!=="count") html+=rowHtml(L(w.label), w); });
+      ws.forEach(function(w){ html+=rowHtml(L(w.label), w); });
       html+=sparkHtml(acct);
-      if(acct.stale) html+='<div style="color:#eab308;font-size:11px;margin-top:4px">'+esc(t.acctStale+(acct.error?("："+acct.error):""))+'</div>';
+      if(acct.error||acct.stale) html+='<div style="color:#eab308;font-size:11px;margin-top:4px">'+esc(t.acctStale+(acct.error?("："+acct.error):""))+'</div>';
     }
     // 右下角平时只显示抓取时刻 HH:MM；数据过期（>3 分钟）才标 stale
     var age=dataAgeMin();
@@ -742,7 +765,7 @@
     try{
       if(cache&&cache._fetchedAt){ var _fd=new Date(Date.parse(cache._fetchedAt)); ageTxt=pad(_fd.getHours())+":"+pad(_fd.getMinutes()); }
     }catch(e3){}
-    if(age!=null&&age>3) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
+    if(age!=null&&age>STALE_MIN) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
     html+='<div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--muted-foreground,#71717a)">'
       +'<span data-act="toggle-mode" style="cursor:pointer;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;padding:2px 10px">'+(mode==="used"?t.usedPct:t.leftPct)+'</span>'
       +'<span style="flex:1"></span>'
