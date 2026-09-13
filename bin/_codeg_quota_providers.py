@@ -15,6 +15,8 @@
 """
 import json
 import re
+import time
+import urllib.error
 import urllib.request
 
 
@@ -65,12 +67,24 @@ class KeyAdapter:
         return w
 
 
-def _get_json(url, key, timeout=15):
-    req = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + key, "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+def _get_json(url, key, timeout=15, retries=2):
+    """GET + JSON。TLS/连接类瞬断（如 EOF in violation of protocol）自动重试；
+    HTTP 错误（401/4xx/5xx）立即抛出，不拿无效 key 反复打。"""
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={
+                "Authorization": "Bearer " + key, "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError:
+            raise
+        except Exception as e:
+            last = e
+            if attempt + 1 < retries:
+                time.sleep(1.5)
+    raise last
 
 
 class OpenCodeGoAdapter(KeyAdapter):
