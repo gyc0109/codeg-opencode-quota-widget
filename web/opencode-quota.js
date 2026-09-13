@@ -341,12 +341,13 @@
       html+=rowHtml(t.w5h, u.rolling)+rowHtml(t.wWeek, u.weekly)+rowHtml(t.wMonth, u.monthly);
       html+=sparkHtml(acct.name);
     }
+    // 右下角平时只显示抓取时刻 HH:MM；数据过期（>3 分钟）才标 stale
     var age=dataAgeMin();
     var ageTxt="";
-    if(age!=null){
-      if(age<1){ var _fd=Date.parse(cache._fetchedAt); var _s=Math.max(0,Math.round((Date.now()-_fd)/1000)); ageTxt=(lang()==="zh")?(_s+"秒前"):(_s+"s ago"); }
-      else ageTxt=t.stale(age);
-    }
+    try{
+      if(cache&&cache._fetchedAt){ var _fd=new Date(Date.parse(cache._fetchedAt)); ageTxt=pad(_fd.getHours())+":"+pad(_fd.getMinutes()); }
+    }catch(e3){}
+    if(age!=null&&age>3) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
     html+='<div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--muted-foreground,#71717a)">'
       +'<span data-act="toggle-mode" style="cursor:pointer;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;padding:2px 10px">'+(mode==="used"?t.usedPct:t.leftPct)+'</span>'
       +'<span style="flex:1"></span>'
