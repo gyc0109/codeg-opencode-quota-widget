@@ -1,4 +1,6 @@
 (function(){
+  if(window.__codegQuotaMounted) return; // 防重复注入（多 webview 共用配置 / 重复 userScript）
+  window.__codegQuotaMounted=true;
   // 端点解析：http(s) 页面（Linux 服务端 / 浏览器模式）走同源相对路径；
   // 桌面壳（tauri:// 等自定义协议）无法同源取静态文件，统一走本机 sidecar。
   var IS_WEB=/^https?:$/.test((location.protocol||"").toLowerCase());

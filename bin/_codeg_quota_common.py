@@ -1,6 +1,6 @@
 """codeg-opencode-quota 公共模块：平台/路径/配置解析（Linux + macOS）。
 
-被 updater / api / patch 三个脚本 import（同目录即可）。
+被 updater / api / patch / repair 四个脚本 import（同目录即可）。
 """
 import json
 import os
@@ -43,10 +43,7 @@ def web_root():
         return pathlib.Path(env)
     if IS_MACOS:
         return lib_dir() / "web"
-    env = os.environ.get("CODEG_STATIC_DIR")
-    if env:
-        return pathlib.Path(env)
-    return pathlib.Path("/usr/local/share/codeg/web")
+    return codeg_static_dir()
 
 
 def codeg_static_dir():
@@ -70,7 +67,7 @@ def accounts_file():
 
 
 def fallback_key_files():
-    """quota-accounts.json 不存在时的单 key 回退来源。"""
+    """quota-accounts.json 不存在/损坏时的单 key 回退来源。"""
     return [
         home() / ".config/opencode/opencode.jsonc",
         home() / ".codeg/opencode-go-key",
@@ -78,21 +75,25 @@ def fallback_key_files():
 
 
 def load_accounts():
-    """返回 [(name, api_key)]；账号文件 → 回退配置文件里的单 key。"""
-    try:
-        d = json.loads(accounts_file().read_text(encoding="utf-8"))
-        acc = [(x.get("name", "账号%d" % (i + 1)), x.get("apiKey", ""))
-               for i, x in enumerate(d) if isinstance(x, dict) and x.get("apiKey")]
-        if acc:
-            return acc
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
+    """返回 [(name, api_key)]。
+
+    账号文件存在且可解析时以其为准——空列表就是空（保证"删除最后一个账号"生效），
+    仅当文件不存在或损坏时才回退到配置文件里的单 key。
+    """
+    f = accounts_file()
+    if f.exists():
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, list):
+                return [(x.get("name", "账号%d" % (i + 1)), x.get("apiKey", ""))
+                        for i, x in enumerate(d) if isinstance(x, dict) and x.get("apiKey")]
+            print("opencode-quota: accounts file is not a list, using fallback", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
     for p in fallback_key_files():
         try:
             t = p.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, ValueError):
             continue
         m = re.search(r'"apiKey"\s*:\s*"([^"]+)"', t)
         if m:
@@ -103,13 +104,47 @@ def load_accounts():
     return []
 
 
+def atomic_write_text(path, text, mode=None):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 临时名带 pid：多个 updater 进程（daemon + api 触发的 --once）并发时互不踩踏
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save_accounts(acc):
+    """写账号文件（原子 + 600）。"""
+    atomic_write_text(
+        accounts_file(),
+        json.dumps([{"name": n, "apiKey": k} for n, k in acc], ensure_ascii=False, indent=2),
+        mode=0o600)
+
+
+def safe_int(name, default, minimum=None):
+    """读环境变量整数：非法值回退默认（避免 KeepAlive 死循环刷日志）。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        print("opencode-quota: bad %s=%r, using %d" % (name, raw, default), file=sys.stderr)
+        return default
+    if minimum is not None and v < minimum:
+        print("opencode-quota: %s=%d below minimum %d, using %d"
+              % (name, v, minimum, default), file=sys.stderr)
+        return default
+    return v
+
+
 def write_targets(basename):
-    """数据文件要写往的目录列表：data_dir 恒写；web_root 存在时同时镜像。"""
+    """数据文件要写往的路径列表：data_dir 恒写；web_root 存在时同时镜像。"""
     dirs = [data_dir()]
     wr = web_root()
-    try:
-        if wr.is_dir() and wr.resolve() != data_dir().resolve():
-            dirs.append(wr)
-    except OSError:
-        pass
-    return [(d / basename, d) for d in dirs]
+    if wr.is_dir() and wr.resolve() != data_dir().resolve():
+        dirs.append(wr)
+    return [d / basename for d in dirs]

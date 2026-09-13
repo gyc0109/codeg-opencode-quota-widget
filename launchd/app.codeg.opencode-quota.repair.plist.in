@@ -8,16 +8,18 @@
 	<array>
 		<string>@@PY@@</string>
 		<string>@@LIB@@/bin/codeg-opencode-quota-repair</string>
+		<string>--app</string>
+		<string>@@APP@@</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>WatchPaths</key>
 	<array>
+		<string>@@APP@@</string>
 		<string>@@APP@@/Contents/MacOS/codeg</string>
-		<string>@@APP@@/Contents/Info.plist</string>
 	</array>
 	<key>StartInterval</key>
-	<integer>1800</integer>
+	<integer>3600</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>StandardOutPath</key>

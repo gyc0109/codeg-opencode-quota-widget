@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """codeg-opencode-quota 管理接口（sidecar）.
 
-- /api/accounts         账号增删（请求头 X-Codeg-Token 鉴权；未配置 token 时放行）
-- /quota.json          额度数据（供桌面壳注入模式跨源读取，公开数据不鉴权）
-- /quota-history.jsonl 24h 历史（同上）
+- /api/accounts         账号增删（请求头 X-Codeg-Token 鉴权）
+- /quota.json          额度数据（桌面壳跨源读取）
+- /quota-history.jsonl 24h 历史
 
-完整 key 永不外泄，账号列表只返回脱敏前缀。
+鉴权：配置了 CODEG_TOKEN 时全部接口要求 token；未配置时（macOS 桌面默认）只接受
+本机/桌面壳来源（Origin 白名单），阻止任意网站跨源读写。完整 key 永不外泄，
+账号列表只返回脱敏前缀。
 """
 import json
 import os
@@ -13,6 +15,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -21,9 +24,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _codeg_quota_common as common  # noqa: E402
 
 USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
-PORT = int(os.environ.get("OPENCODE_QUOTA_API_PORT", "3081"))
+PORT = common.safe_int("OPENCODE_QUOTA_API_PORT", 3081, minimum=1)
 HOST = os.environ.get("OPENCODE_QUOTA_API_HOST", "127.0.0.1" if common.IS_MACOS else "0.0.0.0")
 ENV_FILE = "/etc/codeg.env"
+REFRESH_DEBOUNCE_S = 10
 
 
 def load_token():
@@ -43,18 +47,8 @@ def load_token():
 CODEG_TOKEN = load_token()
 
 
-def load_accounts():
-    return common.load_accounts()
-
-
 def save_accounts(acc):
-    path = common.accounts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump([{"name": n, "apiKey": k} for n, k in acc], f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    common.save_accounts(acc)
 
 
 def check_key(key):
@@ -70,6 +64,15 @@ def check_key(key):
 
 
 def trigger_refresh():
+    """触发一次抓取；10 秒内已有触发则跳过（防连点/重试风暴）。"""
+    stamp = common.data_dir() / ".last-refresh"
+    try:
+        if stamp.exists() and (time.time() - stamp.stat().st_mtime) < REFRESH_DEBOUNCE_S:
+            return
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
     updater = pathlib.Path(__file__).resolve().with_name("codeg-opencode-quota-updater")
     if not updater.is_file():
         updater = pathlib.Path("/usr/local/bin/codeg-opencode-quota-updater")
@@ -81,9 +84,8 @@ def trigger_refresh():
 
 
 def local_file(name):
-    """读取数据文件：优先 data 目录，回退 web 静态根。"""
-    for d in (common.data_dir(), common.web_root()):
-        p = d / name
+    """读取数据文件：按写入目标顺序找（data 目录优先）。"""
+    for p in common.write_targets(name):
         try:
             if p.is_file():
                 return p.read_bytes()
@@ -97,9 +99,10 @@ class H(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         try:
-            sys.stderr.write("quota-api: %s\n" % (fmt % args))
+            origin = self.headers.get("Origin", "-")
+            sys.stderr.write("quota-api: [%s] %s\n" % (origin, fmt % args))
         except Exception:
-            sys.stderr.write("quota-api: %s %s\n" % (fmt, args))
+            pass
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -124,11 +127,29 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _origin_ok(self):
+        """未配置 token 时的来源白名单：无 Origin（curl/本机进程）、桌面壳、本机来源。"""
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return True
+        if origin == "null":  # file:// / 部分自定义协议（WKWebView 可能如此）
+            return True
+        m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://([^/]*)", origin)
+        if not m:
+            return False
+        scheme, host = m.group(1).lower(), m.group(2).lower()
+        if scheme in ("tauri", "file", "asset"):
+            return True
+        if host.startswith("["):
+            host = host[: host.index("]") + 1]
+        elif ":" in host:
+            host = host.rsplit(":", 1)[0]
+        return host in ("127.0.0.1", "localhost", "::1", "[::1]")
+
     def _authed(self):
-        if not CODEG_TOKEN:
-            return True  # 未配置 token 时放行（本机可信环境兜底）
-        # 只认请求头，不接受 ?token=（query 会进访问日志）
-        return self.headers.get("X-Codeg-Token", "") == CODEG_TOKEN
+        if CODEG_TOKEN:
+            return self.headers.get("X-Codeg-Token", "") == CODEG_TOKEN
+        return self._origin_ok()
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -137,22 +158,19 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        # 额度数据（公开只读，桌面壳跨源读取用）
+        if not self._authed():
+            return self._send(401, {"error": "unauthorized"})
         if path == "/quota.json":
             body = local_file("opencode-quota.json")
             if body is None:
                 return self._send(404, {"error": "no quota data yet"})
             return self._send_raw(200, body, "application/json; charset=utf-8")
         if path == "/quota-history.jsonl":
-            body = local_file("opencode-quota-history.jsonl")
-            if body is None:
-                return self._send_raw(200, b"", "text/plain; charset=utf-8")
+            body = local_file("opencode-quota-history.jsonl") or b""
             return self._send_raw(200, body, "text/plain; charset=utf-8")
         if path != "/api/accounts":
             return self._send(404, {"error": "not found"})
-        if not self._authed():
-            return self._send(401, {"error": "unauthorized"})
-        acc = load_accounts()
+        acc = common.load_accounts()
         self._send(200, {"accounts": [
             {"name": n, "keyPrefix": (k[:10] + "..." if len(k) > 13 else "***")}
             for n, k in acc]})
@@ -167,8 +185,10 @@ class H(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n).decode() or "{}")
         except (ValueError, json.JSONDecodeError):
             return self._send(400, {"error": "bad json"})
-        name = (body.get("name") or "").strip()[:32]
-        key = (body.get("apiKey") or "").strip()
+        if not isinstance(body, dict):
+            return self._send(400, {"error": "body must be a json object"})
+        name = str(body.get("name") or "").strip()[:32]
+        key = str(body.get("apiKey") or "").strip()
         if not name or not key:
             return self._send(400, {"error": "name and apiKey required"})
         if not re.fullmatch(r"sk-[A-Za-z0-9_-]{8,}", key):
@@ -177,7 +197,7 @@ class H(BaseHTTPRequestHandler):
             usage = check_key(key)
         except Exception as e:
             return self._send(502, {"error": ("key validation failed: %s" % e)[:200]})
-        acc = [(nn, kk) for nn, kk in load_accounts() if nn != name]
+        acc = [(nn, kk) for nn, kk in common.load_accounts() if nn != name]
         acc.append((name, key))
         try:
             save_accounts(acc)
@@ -196,7 +216,7 @@ class H(BaseHTTPRequestHandler):
         name = parse_qs(urlparse(self.path).query).get("name", [""])[0].strip()
         if not name:
             return self._send(400, {"error": "name required"})
-        acc = load_accounts()
+        acc = common.load_accounts()
         if not any(n == name for n, _ in acc):
             return self._send(404, {"error": "no such account"})
         save_accounts([(n, k) for n, k in acc if n != name])
@@ -206,7 +226,8 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     if not CODEG_TOKEN:
-        print("quota-api: WARNING no CODEG_TOKEN found, auth disabled", file=sys.stderr)
+        print("quota-api: no CODEG_TOKEN, origin allowlist mode (localhost/desktop only)",
+              file=sys.stderr)
     httpd = ThreadingHTTPServer((HOST, PORT), H)
     print("quota-api: listening on %s:%d" % (HOST, PORT), flush=True)
     httpd.serve_forever()

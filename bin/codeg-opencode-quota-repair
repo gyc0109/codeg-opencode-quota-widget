@@ -4,16 +4,18 @@
 用法:
   codeg-opencode-quota-repair            # 需要时修复（幂等；repair LaunchAgent 调用）
   codeg-opencode-quota-repair --force    # 强制重新注入
-  codeg-opencode-quota-repair --remove   # 移除注入：有同版本官方备份则整体还原，否则剥离注入并重签
-  --app PATH                             # 覆盖 app 路径（dry-run 测试用）
+  codeg-opencode-quota-repair --remove   # 移除注入（未注入过则什么都不做）
+  --app PATH                             # 覆盖 app 路径（默认: CODEG_APP 环境变量 >
+                                         #   lib/app-path.txt（安装时记录）> /Applications/codeg.app）
 
-原理: 官方版检测（Developer ID 签名）→ 快照备份 → 复制 dylib 到 Contents/Frameworks/
-      → Info.plist 增加 LSEnvironment.DYLD_INSERT_LIBRARIES → ad-hoc 重签（保留 hardened runtime，
-      附 allow-dyld-environment-variables + disable-library-validation）。
+原理: 官方版检测（Developer ID 签名）→ 快照备份（版本相同则复用）→ 复制 dylib 到
+      Contents/Frameworks/ → Info.plist 增加 LSEnvironment.DYLD_INSERT_LIBRARIES
+      → ad-hoc 重签（保留 hardened runtime + 两个放行 entitlement）。
 codeg 自动更新会整体替换 bundle，本脚本检测到官方签名后自动重新注入。
 """
 import argparse
 import datetime
+import fcntl
 import pathlib
 import plistlib
 import shutil
@@ -25,7 +27,64 @@ import _codeg_quota_common as common  # noqa: E402
 
 DYLD_NAME = "libcodegquota.dylib"
 ENT_NAME = "quota-tweak.entitlements"
-DEFAULT_APP = "/Applications/codeg.app"
+
+
+class Lock:
+    """与安装器/agent 并发时串行化（安装器写 bundle 途中 agent 被 WatchPaths 唤起）。"""
+
+    def __init__(self):
+        self.fh = None
+
+    def __enter__(self):
+        lock_path = common.lib_dir() / ".repair.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(lock_path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+            self.fh.close()
+        except OSError:
+            pass
+
+
+def notify(title, message):
+    """launchd 上下文里优雅提示（通知失败不影响主流程）。"""
+    try:
+        subprocess.run(["osascript", "-e",
+                        'display notification "%s" with title "%s"'
+                        % (message.replace('"', "'"), title.replace('"', "'"))],
+                       capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def explain_blocked():
+    """App Management(TCC) 拦截了 bundle 写入（launchd 后台进程无权限）。
+
+    交互式运行（codeg 自带终端 / 用户终端并授权）不受影响。
+    """
+    cmd = str(common.lib_dir() / "bin" / "codeg-opencode-quota-repair")
+    log("BLOCKED: codeg.app 受 macOS 权限保护(TCC)，后台进程无法修改。"
+        "请在 codeg 自带终端里运行: %s --force" % cmd)
+    notify("codeg 额度药丸待恢复",
+           "codeg 更新后请在 codeg 终端运行 codeg-opencode-quota-repair --force")
+
+
+def default_app():
+    env = (__import__("os").environ.get("CODEG_APP") or "").strip()
+    if env:
+        return env
+    marker = common.lib_dir() / "app-path.txt"
+    try:
+        val = marker.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+    except (OSError, ValueError):
+        pass
+    return "/Applications/codeg.app"
 
 
 def log(msg):
@@ -71,6 +130,16 @@ def verify_ok(app):
 
 
 def current_dylib_path(app):
+    """注入目标 dylib：放在本工具目录（app bundle 之外）。
+
+    bundle 内的文件受 macOS App Management(TCC) 保护，launchd 后台进程无权写入；
+    放在自有目录后，dylib 的更新/替换完全不需要动 app。
+    """
+    return common.lib_dir() / DYLD_NAME
+
+
+def legacy_dylib_path(app):
+    """旧版注入位置（bundle 内），迁移时清理。"""
     return pathlib.Path(app) / "Contents" / "Frameworks" / DYLD_NAME
 
 
@@ -82,41 +151,91 @@ def injected_dylib_in_plist(app):
     return (d.get("LSEnvironment") or {}).get("DYLD_INSERT_LIBRARIES")
 
 
+def is_injected(app):
+    return bool(injected_dylib_in_plist(app)) or current_dylib_path(app).is_file()
+
+
 def backup_dir():
     return common.lib_dir() / "app-backup"
 
 
-def needs_repair(app, force):
-    if force:
-        return True, "forced"
+def backup_app():
+    return backup_dir() / "codeg.app"
+
+
+def needs_repair(app, sig_kind):
     if not current_dylib_path(app).is_file():
         return True, "dylib missing"
     if injected_dylib_in_plist(app) != str(current_dylib_path(app)):
         return True, "LSEnvironment missing/stale"
-    if signature_kind(app) != "adhoc":
+    if sig_kind != "adhoc":
         return True, "bundle signature is not ad-hoc (app was updated?)"
+    if not verify_ok(app):
+        return True, "code signature seal broken (partial update?)"
     return False, "up to date"
 
 
-def snapshot_backup(app):
-    """官方版快照（仅当签名有效且为 Developer ID）。"""
-    if signature_kind(app) != "official":
-        log("skip snapshot: app is not officially signed")
-        return False
+def snapshot_backup(app, current_ver):
+    """官方版快照；同版本已有备份则复用。返回 True 表示备份可用。"""
+    bak = backup_app()
+    if bak.is_dir() and app_version(bak / "Contents" / "Info.plist") == current_ver:
+        if run(["codesign", "--verify", bak]).returncode == 0:
+            return True
+        log("existing backup failed verify, re-snapshotting")
     if not verify_ok(app):
-        log("skip snapshot: codesign verify failed (可能是更新进行中)")
+        log("ERROR: codesign verify failed on current bundle (更新进行中？) — 不注入")
         return False
     bdir = backup_dir()
     bdir.mkdir(parents=True, exist_ok=True)
-    dst = bdir / "codeg.app"
-    if dst.exists():
-        shutil.rmtree(dst)
-    log("snapshot official bundle -> %s" % dst)
-    r = run(["ditto", app, dst])
+    tmp = bdir / "codeg.app.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    log("snapshot official bundle -> %s" % bak)
+    r = run(["ditto", app, tmp])
     if r.returncode != 0:
-        log("snapshot failed: %s" % (r.stderr.strip() or r.returncode))
+        log("ERROR: snapshot failed (%s) — 不注入，保证可回滚" % (r.stderr.strip() or r.returncode))
+        shutil.rmtree(tmp, ignore_errors=True)
         return False
+    if bak.exists():
+        shutil.rmtree(bak)
+    tmp.rename(bak)
     return True
+
+
+def refresh_web_copy(app):
+    """codeg 升级后刷新浏览器模式的 web 副本（否则旧 UI 配新后端）。"""
+    web = common.lib_dir() / "web"
+    if not web.is_dir():
+        return
+    stamp = common.lib_dir() / "web.version"
+    ver = app_version(pathlib.Path(app) / "Contents" / "Info.plist")
+    try:
+        old = stamp.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        old = ""
+    if not old:
+        # 无戳（老安装）：只记当前版本，不做替换，避免意外重写
+        try:
+            stamp.write_text(ver, encoding="utf-8")
+        except OSError:
+            pass
+        return
+    if old == ver:
+        return
+    src = pathlib.Path(app) / "Contents" / "Resources" / "web"
+    if not src.is_dir():
+        return
+    log("refreshing web copy for codeg v%s (was %s)" % (ver, old))
+    r = run(["rsync", "-a", "--delete", str(src) + "/", str(web) + "/"])
+    if r.returncode != 0:
+        log("web copy refresh failed: %s" % (r.stderr.strip() or r.returncode))
+        return
+    patch = pathlib.Path(__file__).resolve().with_name("codeg-opencode-quota-patch")
+    run([sys.executable, str(patch)])
+    try:
+        stamp.write_text(ver, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def apply(app, force):
@@ -128,65 +247,98 @@ def apply(app, force):
     src_dylib = lib / DYLD_NAME
     ent = lib / ENT_NAME
     if not src_dylib.is_file() or not ent.is_file():
-        log("dylib/entitlements missing in %s (run install --desktop-tweak first)" % lib)
-        return 1
-
-    need, why = needs_repair(app, force)
-    if not need:
+        # 未装桌面注入（浏览器模式）：本 agent 只负责 web 副本的版本刷新
+        refresh_web_copy(app)
         return 0
+
+    sig_kind = signature_kind(app)
+    if not force:
+        need, why = needs_repair(app, sig_kind)
+        if not need:
+            refresh_web_copy(app)
+            return 0
+    else:
+        why = "forced"
     log("injecting (%s)" % why)
 
-    if signature_kind(app) == "official":
-        snapshot_backup(app)
-    elif not backup_dir().joinpath("codeg.app").is_dir():
+    if sig_kind == "official":
+        ver = app_version(app / "Contents" / "Info.plist")
+        if not snapshot_backup(app, ver):
+            return 1  # 没有可用备份就不动 app
+    elif not backup_app().is_dir():
         log("WARNING: 无官方备份且当前 bundle 非官方签名，卸载时只能剥离注入（建议届时重装官方包）")
 
-    dst_dylib = current_dylib_path(app)
-    dst_dylib.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_dylib, dst_dylib)
-
-    plist_path = app / "Contents" / "Info.plist"
-    data, fmt = read_plist(plist_path)
-    env = data.get("LSEnvironment") or {}
-    env["DYLD_INSERT_LIBRARIES"] = str(dst_dylib)
-    data["LSEnvironment"] = env
-    write_plist(plist_path, data, fmt)
-    log("Info.plist LSEnvironment set: %s" % dst_dylib)
-
+    dst_dylib = current_dylib_path(app)  # lib 目录内（bundle 外），无需拷贝
     r = run(["codesign", "--force", "--sign", "-", dst_dylib])
     if r.returncode != 0:
         log("codesign dylib failed: %s" % (r.stderr.strip() or r.returncode))
         return 1
+
+    # 迁移：清理旧版放在 bundle 内的 dylib（无权限时仅告警，不影响新路径生效）
+    legacy = legacy_dylib_path(app)
+    if legacy.is_file():
+        try:
+            legacy.unlink()
+            log("removed legacy in-bundle dylib")
+        except OSError as e:
+            log("WARNING: legacy in-bundle dylib not removed: %s" % e)
+
+    plist_path = app / "Contents" / "Info.plist"
+    try:
+        data, fmt = read_plist(plist_path)
+        env = data.get("LSEnvironment") or {}
+        env["DYLD_INSERT_LIBRARIES"] = str(dst_dylib)
+        data["LSEnvironment"] = env
+        write_plist(plist_path, data, fmt)
+    except PermissionError:
+        explain_blocked()
+        return 1
+    log("Info.plist LSEnvironment set: %s" % dst_dylib)
+
     r = run(["codesign", "--force", "--sign", "-", "--options", "runtime",
              "--entitlements", ent, app])
     if r.returncode != 0:
-        log("codesign app failed: %s" % (r.stderr.strip() or r.returncode))
+        out = (r.stderr or "") + (r.stdout or "")
+        if "Operation not permitted" in out or "Permission denied" in out:
+            explain_blocked()
+        else:
+            log("codesign app failed: %s" % (out.strip() or r.returncode))
         return 1
     if verify_ok(app):
         log("injected & re-signed ok (v%s)" % app_version(plist_path))
     else:
-        log("WARNING: codesign verify failed after re-sign")
+        log("ERROR: codesign verify failed after re-sign")
         return 1
+    refresh_web_copy(app)
     return 0
 
 
 def remove(app):
     app = pathlib.Path(app)
-    bdir = backup_dir() / "codeg.app"
+    sig_kind = signature_kind(app)
+    if sig_kind == "official" and not is_injected(app):
+        log("nothing injected (official bundle intact) — skip")
+        return 0
+    if not app.is_dir():
+        log("app not found: %s" % app)
+        return 0
+
     cur_ver = app_version(app / "Contents" / "Info.plist")
-    bak_ver = app_version(bdir / "Contents" / "Info.plist") if bdir.is_dir() else "?"
-    if bdir.is_dir() and cur_ver == bak_ver:
+    bak = backup_app()
+    bak_ver = app_version(bak / "Contents" / "Info.plist") if bak.is_dir() else "?"
+    if bak.is_dir() and cur_ver != "?" and cur_ver == bak_ver:
         log("restoring official bundle from backup (v%s)" % cur_ver)
-        r = run(["rsync", "-a", "--delete", str(bdir) + "/", str(app) + "/"])
+        if not _cleanup_injected_dylibs(app):
+            return 1
+        r = run(["ditto", str(bak), str(app)])
         if r.returncode != 0:
             log("restore failed: %s" % (r.stderr.strip() or r.returncode))
             return 1
         log("restored; signature: %s, verify: %s" % (signature_kind(app), verify_ok(app)))
         return 0
-    log("no matching official backup (current=%s backup=%s); stripping injection instead" % (cur_ver, bak_ver))
-    dst_dylib = current_dylib_path(app)
-    if dst_dylib.is_file():
-        dst_dylib.unlink()
+
+    log("no matching official backup (current=%s backup=%s); stripping injection" % (cur_ver, bak_ver))
+    # 顺序很重要：先改 plist（失败则 app 仍可启动），再删 dylib，最后重签
     plist_path = app / "Contents" / "Info.plist"
     try:
         data, fmt = read_plist(plist_path)
@@ -197,8 +349,13 @@ def remove(app):
         else:
             data.pop("LSEnvironment", None)
         write_plist(plist_path, data, fmt)
+    except PermissionError:
+        explain_blocked()
+        return 1
     except Exception as e:
-        log("plist edit failed: %s" % e)
+        log("plist edit failed (app 保持原状): %s" % e)
+        return 1
+    if not _cleanup_injected_dylibs(app):
         return 1
     ent = common.lib_dir() / ENT_NAME
     args = ["codesign", "--force", "--sign", "-", "--options", "runtime"]
@@ -207,21 +364,53 @@ def remove(app):
     args.append(app)
     r = run(args)
     if r.returncode != 0:
-        log("re-sign failed: %s" % (r.stderr.strip() or r.returncode))
+        out = (r.stderr or "") + (r.stdout or "")
+        if "Operation not permitted" in out or "Permission denied" in out:
+            explain_blocked()
+        else:
+            log("re-sign failed: %s" % (out.strip() or r.returncode))
         return 1
     log("injection stripped (bundle remains ad-hoc signed; 重装官方包可完全恢复)")
     return 0
+
+
+def _cleanup_injected_dylibs(app):
+    """删除注入的 dylib（LSEnvironment 指向的 + 旧版 bundle 内位置）与空 Frameworks 目录。"""
+    targets = []
+    cur = injected_dylib_in_plist(app)
+    if cur:
+        targets.append(pathlib.Path(cur))
+    legacy = legacy_dylib_path(app)
+    if legacy not in targets:
+        targets.append(legacy)
+    for t in targets:
+        if t.is_file():
+            try:
+                t.unlink()
+                log("removed %s" % t)
+            except OSError as e:
+                log("dylib remove failed (%s): %s" % (t, e))
+                return False
+    fw = pathlib.Path(app) / "Contents" / "Frameworks"
+    try:
+        if fw.is_dir() and not any(fw.iterdir()):
+            fw.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--remove", action="store_true")
-    ap.add_argument("--app", default=DEFAULT_APP)
+    ap.add_argument("--app", default=None)
     args = ap.parse_args()
-    if args.remove:
-        return remove(args.app)
-    return apply(args.app, args.force)
+    app = args.app or default_app()
+    with Lock():
+        if args.remove:
+            return remove(app)
+        return apply(app, args.force)
 
 
 if __name__ == "__main__":

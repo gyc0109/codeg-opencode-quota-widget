@@ -9,7 +9,7 @@
 | 平台 | 形态 | 安装方式 |
 |---|---|---|
 | Linux | codeg-server（systemd） | `sudo ./install.sh` |
-| macOS | 浏览器模式：本机 :3080 提供 codeg web UI | `./install.sh --browser` |
+| macOS | 浏览器模式：:3080 提供 codeg web UI（默认监听所有网卡，局域网可访问） | `./install.sh --browser` |
 | macOS | 桌面版 codeg.app 窗口内注入（实验性） | `./install.sh --desktop-tweak` |
 
 ## 效果
@@ -65,6 +65,8 @@ macOS 上安装内容：
 用独立 `codeg-server` 进程在 `:3080` 提供打补丁的 web UI（数据目录与桌面版共享）：
 
 - 浏览器访问 `http://127.0.0.1:3080/`，首次在登录页填安装时打印的 token
+- 服务默认监听所有网卡（局域网可访问，codeg 自带 token 登录保护；静态文件不鉴权）
+- codeg 升级后 repair agent 会自动刷新 web 副本（浏览器模式也会装这个 agent）
 - 与桌面版可同时运行；不想要了：`./uninstall.sh` 或只删 server 相关 plist
 
 #### 桌面注入模式（`--desktop-tweak`，实验性）
@@ -89,7 +91,8 @@ dylib 注入（`WKWebView` userScript 注入前端脚本）：
 ]
 ```
 
-- 文件不存在时自动回退：`opencode.jsonc` 里的 `apiKey` → `~/.codeg/opencode-go-key`
+- 文件不存在或损坏时自动回退：`opencode.jsonc` 里的 `apiKey` → `~/.codeg/opencode-go-key`；
+  文件存在时以文件为准（`[]` 就是"没有账号"，删除最后一个账号不会被回退复活）
 - 也可以直接在网页详情浮层点 `＋` 添加（后端先校验 Key 有效性再写入，所有浏览器共享）
 - 后台默认每 60 秒刷新：`OPENCODE_QUOTA_INTERVAL=60`
 
@@ -138,7 +141,12 @@ updater(定时) ──写──> data 目录（规范） + web 静态根（存�
 
 - Key 只存在本机 600 文件和服务端内存；前端拿到的只有百分比和重置时间，列表接口仅返回 Key 前 10 位脱敏
 - 能进你 codeg 网页的人理论上能调管理接口（与 codeg 同权），请自行保护好 codeg 访问 token
-- macOS 浏览器模式的静态文件（含额度百分比）不鉴权，同 Linux 行为；如需仅本机访问见 `OPENCODE_QUOTA_API_HOST` 与系统防火墙
+- `:3081` 管理接口：配置了 `CODEG_TOKEN` 时全部接口要求 token；未配置时（macOS 桌面默认）
+  只接受本机/桌面壳来源（Origin 白名单），任意网站无法跨源调用
+- macOS 浏览器模式的静态文件（含额度百分比）不鉴权，与 Linux 行为一致；服务监听所有网卡，
+  介意的话可用系统防火墙限制入站
+- 桌面注入模式下 codeg 为 ad-hoc 签名（失去官方 Developer ID 身份）——这是注入的固有代价，
+  `--remove` 会从官方备份整体还原
 
 ## License
 

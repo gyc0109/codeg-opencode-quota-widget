@@ -3,7 +3,8 @@
 
 - 母本 js 从 lib 目录回拷到 web 根（升级覆盖 web 目录后自动恢复）
 - 所有 html 注入 <script src="/opencode-quota.js"></script>（递归，幂等）
-- 注入前把未注入过的原文备份到 lib/html-backup/（供卸载还原 / 升级后自动换新备份）
+- 注入前把未注入过的原文备份到 lib/html-backup/（codeg 升级后自动换新备份，
+  也供人工比对恢复）
 
 web 根不存在时直接退出（未启用浏览器模式/未装 codeg 的机器上安全 no-op）。
 """
@@ -41,16 +42,16 @@ def main():
     count = 0
     for path in sorted(web.rglob("*.html")):
         try:
-            s = path.read_text(encoding="utf-8", errors="surrogateescape")
+            cur = path.read_bytes()
         except OSError:
             continue
+        s = cur.decode("utf-8", errors="surrogateescape")
         rel = path.relative_to(web)
         bak = backup_dir / rel
         if "/opencode-quota.js" in s:
             continue
         # 原文备份：无备份，或内容与备份不同（codeg 升级后的新原文）→ 刷新备份
         try:
-            cur = path.read_bytes()
             if (not bak.is_file()) or bak.read_bytes() != cur:
                 bak.parent.mkdir(parents=True, exist_ok=True)
                 bak.write_bytes(cur)
