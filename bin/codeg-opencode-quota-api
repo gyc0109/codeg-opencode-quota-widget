@@ -16,14 +16,13 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _codeg_quota_common as common  # noqa: E402
+import _codeg_quota_providers as providers  # noqa: E402
 
-USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 PORT = common.safe_int("OPENCODE_QUOTA_API_PORT", 3081, minimum=1)
 HOST = os.environ.get("OPENCODE_QUOTA_API_HOST", "127.0.0.1" if common.IS_MACOS else "0.0.0.0")
 ENV_FILE = "/etc/codeg.env"
@@ -47,20 +46,8 @@ def load_token():
 CODEG_TOKEN = load_token()
 
 
-def save_accounts(acc):
-    common.save_accounts(acc)
-
-
-def check_key(key):
-    req = urllib.request.Request(USAGE_URL, headers={
-        "Authorization": "Bearer " + key, "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        d = json.loads(r.read().decode())
-    u = d.get("usage", d)
-    if not (u.get("rolling") and u.get("weekly") and u.get("monthly")):
-        raise ValueError("unexpected usage response")
-    return u
+def save_accounts(acc, provider=common.DEFAULT_PROVIDER):
+    common.save_accounts(acc, provider)
 
 
 def trigger_refresh():
@@ -170,9 +157,12 @@ class H(BaseHTTPRequestHandler):
             return self._send_raw(200, body, "text/plain; charset=utf-8")
         if path != "/api/accounts":
             return self._send(404, {"error": "not found"})
-        acc = common.load_accounts()
+        provider = (parse_qs(urlparse(self.path).query).get("provider")
+                    or [common.DEFAULT_PROVIDER])[0].strip() or common.DEFAULT_PROVIDER
+        acc = common.load_accounts(provider)
         self._send(200, {"accounts": [
-            {"name": n, "keyPrefix": (k[:10] + "..." if len(k) > 13 else "***")}
+            {"provider": provider, "name": n,
+             "keyPrefix": (k[:10] + "..." if len(k) > 13 else "***")}
             for n, k in acc]})
 
     def do_POST(self):
@@ -189,39 +179,47 @@ class H(BaseHTTPRequestHandler):
             return self._send(400, {"error": "body must be a json object"})
         name = str(body.get("name") or "").strip()[:32]
         key = str(body.get("apiKey") or "").strip()
+        provider = str(body.get("provider") or common.DEFAULT_PROVIDER).strip() or common.DEFAULT_PROVIDER
         if not name or not key:
             return self._send(400, {"error": "name and apiKey required"})
-        if not re.fullmatch(r"sk-[A-Za-z0-9_-]{8,}", key):
-            return self._send(400, {"error": "apiKey looks invalid (expect sk-...)"})
+        adapter = providers.get_adapter(provider)
+        if adapter is None:
+            return self._send(400, {"error": "unknown provider: %s" % provider})
+        if not adapter.key_pattern.fullmatch(key):
+            return self._send(400, {"error": "apiKey looks invalid for %s" % provider})
         try:
-            usage = check_key(key)
+            norm = adapter.validate(key)
         except Exception as e:
             return self._send(502, {"error": ("key validation failed: %s" % e)[:200]})
-        acc = [(nn, kk) for nn, kk in common.load_accounts() if nn != name]
+        acc = [(nn, kk) for nn, kk in common.load_accounts(provider) if nn != name]
         acc.append((name, key))
         try:
-            save_accounts(acc)
+            save_accounts(acc, provider)
         except OSError as e:
             return self._send(500, {"error": "save failed: %s" % e})
         trigger_refresh()
-        r = usage["rolling"]
-        self._send(200, {"ok": True, "name": name,
-                         "check": {"rolling": r.get("percent"), "resetsAt": r.get("resetsAt")}})
+        check = {"provider": provider, "windows": norm["windows"]}
+        if provider == common.DEFAULT_PROVIDER:
+            r = ((norm.get("extra") or {}).get("usage") or {}).get("rolling") or {}
+            check["rolling"] = {"percent": r.get("percent"), "resetsAt": r.get("resetsAt")}
+        self._send(200, {"ok": True, "name": name, "check": check})
 
     def do_DELETE(self):
         if urlparse(self.path).path != "/api/accounts":
             return self._send(404, {"error": "not found"})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
-        name = parse_qs(urlparse(self.path).query).get("name", [""])[0].strip()
+        q = parse_qs(urlparse(self.path).query)
+        name = (q.get("name") or [""])[0].strip()
+        provider = (q.get("provider") or [common.DEFAULT_PROVIDER])[0].strip() or common.DEFAULT_PROVIDER
         if not name:
             return self._send(400, {"error": "name required"})
-        acc = common.load_accounts()
+        acc = common.load_accounts(provider)
         if not any(n == name for n, _ in acc):
             return self._send(404, {"error": "no such account"})
-        save_accounts([(n, k) for n, k in acc if n != name])
+        save_accounts([(n, k) for n, k in acc if n != name], provider)
         trigger_refresh()
-        self._send(200, {"ok": True, "deleted": name})
+        self._send(200, {"ok": True, "deleted": name, "provider": provider})
 
 
 if __name__ == "__main__":

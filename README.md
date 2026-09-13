@@ -62,9 +62,10 @@ macOS 上安装内容：
 
 #### 浏览器模式（`--browser`）
 
-用独立 `codeg-server` 进程在 `:3080` 提供打补丁的 web UI（数据目录与桌面版共享）：
+用独立 `codeg-server` 进程在 `:3085` 提供打补丁的 web UI（数据目录与桌面版共享）：
 
-- 浏览器访问 `http://127.0.0.1:3080/`，首次在登录页填安装时打印的 token
+- 浏览器访问 `http://127.0.0.1:3085/`，首次在登录页填安装时打印的 token
+- 端口默认 3085（可用 `CODEG_QUOTA_SERVER_PORT` 覆盖）——刻意错开 codeg 自带 web 服务的 3080，两者可共存
 - 服务默认监听所有网卡（局域网可访问，codeg 自带 token 登录保护；静态文件不鉴权）
 - codeg 升级后 repair agent 会自动刷新 web 副本（浏览器模式也会装这个 agent）
 - 与桌面版可同时运行；不想要了：`./uninstall.sh` 或只删 server 相关 plist

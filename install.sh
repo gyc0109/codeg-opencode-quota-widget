@@ -117,6 +117,7 @@ install_macos() {
       "$PY" -c "import sys; sys.path.insert(0, '$LIB/bin'); import _codeg_quota_common as c, plistlib; print(plistlib.loads(open('$APP/Contents/Info.plist','rb').read()).get('CFBundleShortVersionString','?'))" > "$LIB/web.version" 2>/dev/null || true
 
       SERVER_PLIST="$AGENTS/app.codeg.opencode-quota.server.plist"
+      SERVER_PORT="${CODEG_QUOTA_SERVER_PORT:-3085}"
       TOKEN=""
       if [ -f "$SERVER_PLIST" ]; then
         TOKEN="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:CODEG_TOKEN' "$SERVER_PLIST" 2>/dev/null || true)"
@@ -127,7 +128,8 @@ install_macos() {
                    "$SERVER_PLIST" \
                    "s|@@CODEG_SERVER@@|$(esc "$SERVER_BIN")|g" \
                    "s|@@WEBROOT@@|$(esc "$WEBROOT")|g" \
-                   "s|@@TOKEN@@|$TOKEN|g"
+                   "s|@@TOKEN@@|$TOKEN|g" \
+                   "s|@@SERVERPORT@@|$SERVER_PORT|g"
       chmod 600 "$SERVER_PLIST"
       bootstrap_agent app.codeg.opencode-quota.server "$SERVER_PLIST"
       # repair agent 同时负责 codeg 升级后刷新 web 副本（未装桌面注入时只做这件事）
@@ -135,7 +137,7 @@ install_macos() {
                    "$AGENTS/app.codeg.opencode-quota.repair.plist" \
                    "s|@@APP@@|$(esc "$APP")|g"
       bootstrap_agent app.codeg.opencode-quota.repair "$AGENTS/app.codeg.opencode-quota.repair.plist"
-      echo "    浏览器访问: http://127.0.0.1:3080/ （局域网内其他设备可用本机 IP 访问）"
+      echo "    浏览器访问: http://127.0.0.1:$SERVER_PORT/ （局域网内其他设备可用本机 IP 访问；端口可用 CODEG_QUOTA_SERVER_PORT 覆盖）"
       echo "    登录 token: $TOKEN（首次访问登录页填入）"
     fi
   fi

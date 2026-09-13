@@ -9,7 +9,6 @@
   var HIST_URL=IS_WEB?"/opencode-quota-history.jsonl":API_ORIGIN+"/quota-history.jsonl";
   var API_URL="https://opencode.ai/zen/go/v1/usage", REFRESH_MS=60000;
   var LS_ACCT="opencode-quota-account", LS_MODE="opencode-quota-mode", LS_FOLD="opencode-quota-folded"; // mode: left|used
-  var ALERT_PCT=80; // 5h 已用超此值 → 红色脉冲 + 浏览器通知
 
   // ---- i18n：跟随 codeg 语言（cookie codeg.locale，无则跟浏览器） ----
   function lang(){
@@ -49,10 +48,16 @@
       delAcct:"删除该账号",
       usedWord:"已用",
       stale:function(m){ return "数据"+m+"分钟前"; },
-      alert:"5小时额度告急",
-      alertBody:function(n,p){ return "["+n+"] 5小时已用 "+p+"%，注意用量"; },
+      alert:"额度告急",
+      alertPct:function(n,w,p){ return "["+n+"] "+w+" 已用 "+p+"%"; },
+      alertBelow:function(n,v){ return "["+n+"] 余额低于 "+v; },
+      alertRunOut:function(n,w,c){ return "["+n+"] "+w+" 预计"+c+"耗尽"; },
+      perHourSuffix:"/时",
+      drainOut:function(c){ return "约"+c+"耗尽"; },
+      noRunOut:"暂无耗尽趋势",
       h24:"24小时用量",
-      hMax:function(p){ return "最高 "+p+"%"; }
+      hMax:function(p){ return "最高 "+p+"%"; },
+      hPeak:function(v){ return "峰值 "+v; }
     },
     en:{
       quotaTitle:"opencode-go quota · click to expand",
@@ -72,10 +77,16 @@
       delAcct:"Delete this account",
       usedWord:"used",
       stale:function(m){ return m+"m stale"; },
-      alert:"5-hour quota running low",
-      alertBody:function(n,p){ return "["+n+"] 5h used "+p+"%"; },
+      alert:"Quota alert",
+      alertPct:function(n,w,p){ return "["+n+"] "+w+" used "+p+"%"; },
+      alertBelow:function(n,v){ return "["+n+"] balance below "+v; },
+      alertRunOut:function(n,w,c){ return "["+n+"] "+w+" runs out "+c.replace(" left",""); },
+      perHourSuffix:"/h",
+      drainOut:function(c){ return "runs out ~"+c.replace(" left",""); },
+      noRunOut:"no run-out trend",
       h24:"24h usage",
-      hMax:function(p){ return "peak "+p+"%"; }
+      hMax:function(p){ return "peak "+p+"%"; },
+      hPeak:function(v){ return "peak "+v; }
     }
   };
   function S(){ return STR[lang()]||STR.en; }
@@ -106,6 +117,7 @@
   }
 
   var quotaEl=null, popup=null, cache=null, histCache=null, timerStarted=false;
+  var LS_PROVIDER="opencode-quota-provider";
   function apiBase(){ return API_ORIGIN; }
   function apiToken(){ return localStorage.getItem("codeg_token")||""; }
   async function apiCall(method, path, body){
@@ -117,39 +129,148 @@
     return j;
   }
   function getMode(){ return localStorage.getItem(LS_MODE)==="used" ? "used" : "left"; }
-  function getAcct(){ return localStorage.getItem(LS_ACCT) || ""; }
-  function pickAccount(data){
+
+  // ---- provider / 窗口模型（新格式 windows 优先，旧格式 usage 兜底） ----
+  function providerOf(a){ return (a&&a.provider)||"opencode-go"; }
+  function providerList(data){
+    var out=[], seen={}, list=(data&&data.accounts)||[];
+    for(var i=0;i<list.length;i++){ var p=providerOf(list[i]); if(!seen[p]){ seen[p]=1; out.push(p); } }
+    return out;
+  }
+  function accountsOf(data, provider){
+    return ((data&&data.accounts)||[]).filter(function(a){ return providerOf(a)===provider; });
+  }
+  var PROVIDER_NAMES={ "opencode-go":"OpenCode Go", "deepseek":"DeepSeek" };
+  function providerName(p){ return PROVIDER_NAMES[p]||p; }
+  var LEGACY_SPECS=[
+    {id:"rolling",label:{zh:"5小时",en:"5-hour"},primary:true,alert:{pct:[80]}},
+    {id:"weekly",label:{zh:"每周",en:"Weekly"},alert:{pct:[90]}},
+    {id:"monthly",label:{zh:"每月",en:"Monthly"},alert:{pct:[95]}}
+  ];
+  function windowsOf(acct){
+    if(!acct) return [];
+    if(acct.windows&&acct.windows.length) return acct.windows;
+    if(acct.usage){
+      var out=[];
+      for(var i=0;i<LEGACY_SPECS.length;i++){
+        var s=LEGACY_SPECS[i], d=acct.usage[s.id];
+        if(!d) continue;
+        out.push({id:s.id,label:s.label,primary:s.primary,kind:"percent",direction:"used",
+                  percent:d.percent,resetsAt:d.resetsAt,alert:s.alert});
+      }
+      return out;
+    }
+    return [];
+  }
+  function L(label){
+    if(label==null) return "";
+    if(typeof label==="string") return label;
+    return label[lang()]||label.en||label.zh||"";
+  }
+  function hasData(a){ return !!(a&&((a.windows&&a.windows.length)||a.usage)); }
+  function fmtMoney(v,unit){
+    if(v==null) return "—";
+    var sym=unit==="CNY"?"¥":(unit==="USD"?"$":"");
+    var n=Math.abs(v)>=1000?String(Math.round(v)):(Math.abs(v)>=100?Number(v).toFixed(1):Number(v).toFixed(2));
+    return sym?sym+n:(n+" "+(unit||""));
+  }
+  function shortLabel(w){
+    var t=S(), m={rolling:"pill5h",weekly:"pillWeek",monthly:"pillMonth"};
+    if(m[w.id]&&t[m[w.id]]) return t[m[w.id]];
+    return L(w.label);
+  }
+  function colorFor(p){ return p>=90?"#ef4444":p>=70?"#eab308":"#22c55e"; }
+  function dot(p){ return '<span style="display:inline-block;width:6px;height:6px;border-radius:99px;background:'+colorFor(p)+';margin-right:2px;vertical-align:1px"></span>'; }
+  function getAcctSel(){
+    var v=localStorage.getItem(LS_ACCT)||"", i=v.indexOf("/");
+    return i>0?{provider:v.slice(0,i),name:v.slice(i+1)}:{provider:"opencode-go",name:v};
+  }
+  function setAcctSel(p,n){ try{ localStorage.setItem(LS_ACCT, p+"/"+n); }catch(e){} }
+  function activeProvider(data){
+    var saved=localStorage.getItem(LS_PROVIDER);
+    var list=providerList(data);
+    if(saved&&list.indexOf(saved)>=0) return saved;
+    var sel=getAcctSel();
+    if(list.indexOf(sel.provider)>=0) return sel.provider;
+    return list[0]||"opencode-go";
+  }
+  function pickAccount(data, provider){
     if(!data) return null;
     var list=data.accounts||[];
     if(!list.length){
       // 兼容老格式 {usage:{...}}
-      if(data.usage) return { name:"", usage:data.usage };
+      if(data.usage) return { provider:"opencode-go", name:"", usage:data.usage };
       return null;
     }
-    var want=getAcct();
-    for(var i=0;i<list.length;i++) if(list[i].name===want && list[i].usage) return list[i];
-    for(var j=0;j<list.length;j++) if(list[j].usage) { return list[j]; }
-    return list[0];
+    var sel=getAcctSel();
+    var pool=provider?accountsOf(data,provider):list;
+    for(var i=0;i<pool.length;i++){
+      if(pool[i].name===sel.name && providerOf(pool[i])===sel.provider && hasData(pool[i])) return pool[i];
+    }
+    for(var j=0;j<pool.length;j++) if(hasData(pool[j])) return pool[j];
+    return pool[0]||list[0];
   }
 
-  // 高用量提醒：超阈值只通知一次（同账号恢复后再超才重报）
-  function maybeAlert(acct, rolling){
-    if(!acct || rolling==null) return;
-    var key="opencode-quota-alerted-"+acct.name;
-    if(rolling>=ALERT_PCT){
-      quotaEl.classList.add("oq-alert");
-      if(localStorage.getItem(key)) return;
-      localStorage.setItem(key, "1");
-      var t=S();
-      try{
-        if("Notification" in window && Notification.permission==="granted"){
-          new Notification(t.alert, { body:t.alertBody(acct.name||"opencode-go", rolling) });
+  // 告警收集：窗口百分比阈值 / 余额低于阈值 / 预计耗尽；key 带 provider 防止跨源撞名
+  function collectAlerts(data){
+    var out=[], list=(data&&data.accounts)||[];
+    for(var i=0;i<list.length;i++){
+      var a=list[i], p=providerOf(a), ws=windowsOf(a);
+      for(var j=0;j<ws.length;j++){
+        var w=ws[j], al=w.alert||{};
+        if(w.kind==="percent" && w.percent!=null && al.pct && al.pct.length){
+          for(var k=0;k<al.pct.length;k++){
+            var th=al.pct[k];
+            if(w.percent>=th) out.push({key:"p:"+p+":"+a.name+":"+w.id+":"+th, kind:"pct",
+              name:a.name, provider:p, win:L(w.label), pct:w.percent});
+          }
         }
-      }catch(e){}
-    } else {
-      quotaEl.classList.remove("oq-alert");
-      try{ localStorage.removeItem(key); }catch(e){}
+        if((w.kind==="money"||w.kind==="budget") && w.value!=null && al.below!=null && w.value<al.below){
+          out.push({key:"p:"+p+":"+a.name+":"+w.id+":below", kind:"below",
+            name:a.name, provider:p, win:L(w.label), value:w.value, unit:w.unit});
+        }
+        if(w.burn && w.burn.runOutAt && al.runOutHours){
+          var hrs=(Date.parse(w.burn.runOutAt)-Date.now())/3600000;
+          if(hrs>0 && hrs<al.runOutHours){
+            out.push({key:"p:"+p+":"+a.name+":"+w.id+":runout", kind:"runout",
+              name:a.name, provider:p, win:L(w.label), runOutAt:w.burn.runOutAt});
+          }
+        }
+      }
     }
+    return out;
+  }
+  // 每个 key 通知一次；恢复后清除；老版本按账号名的 key 做迁移避免重复通知
+  function applyAlerts(data){
+    if(!quotaEl) return;
+    var alerts=collectAlerts(data), seen={}, t=S();
+    for(var i=0;i<alerts.length;i++){
+      var al=alerts[i];
+      seen[al.key]=1;
+      if(localStorage.getItem("oq-alerted-"+al.key)) continue;
+      if(localStorage.getItem("opencode-quota-alerted-"+al.name)){
+        localStorage.setItem("oq-alerted-"+al.key,"1");
+        continue;
+      }
+      localStorage.setItem("oq-alerted-"+al.key,"1");
+      var body="";
+      if(al.kind==="pct") body=t.alertPct(al.name||providerName(al.provider), al.win, al.pct);
+      else if(al.kind==="below") body=t.alertBelow(al.name||providerName(al.provider), fmtMoney(al.value,al.unit));
+      else if(al.kind==="runout") body=t.alertRunOut(al.name||providerName(al.provider), al.win, countdown(al.runOutAt));
+      try{
+        if("Notification" in window && Notification.permission==="granted"){ new Notification(t.alert,{body:body}); }
+      }catch(e){}
+    }
+    try{
+      var rm=[];
+      for(var n=0;n<localStorage.length;n++){
+        var lk=localStorage.key(n);
+        if(lk && lk.indexOf("oq-alerted-")===0 && !seen[lk.slice(11)]) rm.push(lk);
+      }
+      rm.forEach(function(x){ localStorage.removeItem(x); });
+    }catch(e2){}
+    if(alerts.length) quotaEl.classList.add("oq-alert");
+    else quotaEl.classList.remove("oq-alert");
   }
 
   function isFolded(){ return localStorage.getItem(LS_FOLD)==="1"; }
@@ -175,10 +296,9 @@
     el.addEventListener("click", function(e){
       e.stopPropagation();
       if(isFolded()){ localStorage.setItem(LS_FOLD,"0"); applyFold(); render(cache); return; }
-      // 用户手势里顺便申请通知权限（仅当已超阈值，避免打扰）
+      // 用户手势里顺便申请通知权限（仅当有告警，避免打扰）
       try{
-        var a=pickAccount(cache);
-        if(a&&a.usage&&a.usage.rolling&&a.usage.rolling.percent>=ALERT_PCT
+        if(collectAlerts(cache).length
            &&"Notification" in window&&Notification.permission==="default"){ Notification.requestPermission().catch(function(){}); }
       }catch(err){}
       togglePopup();
@@ -207,28 +327,46 @@
   function render(data){
     if(!quotaEl) return;
     var t=S();
-    var acct=pickAccount(data);
-    if(!acct || !acct.usage){ var inner0=document.getElementById("oq-inline"); if(inner0) inner0.textContent="—"; return; }
-    var mode=getMode(), u=acct.usage, r=u.rolling, w=u.weekly, m=u.monthly;
-    if(!r||!w||!m) return;
     var inner=document.getElementById("oq-inline");
     if(!inner) return;
-    function dot(p){ var c=p>=90?"#ef4444":p>=70?"#eab308":"#22c55e"; return '<span style="display:inline-block;width:6px;height:6px;border-radius:99px;background:'+c+';margin-right:2px;vertical-align:1px"></span>'; }
-    var multi=(cache&&cache.accounts||[]).length>1;
-    var prefix=(acct.name && multi) ? '<span style="opacity:.55;max-width:60px;overflow:hidden;text-overflow:ellipsis">'+esc(acct.name)+'</span><span style="opacity:.25">·</span>' : "";
-    inner.innerHTML=prefix+
-      dot(r.percent)+t.pill5h+' <b>'+(mode==="used"?r.percent:(100-r.percent))+'%</b>'+
-      '<span style="opacity:.25;margin:0 5px">·</span>'+
-      dot(w.percent)+t.pillWeek+' <b>'+(mode==="used"?w.percent:(100-w.percent))+'%</b>'+
-      '<span style="opacity:.25;margin:0 5px">·</span>'+
-      dot(m.percent)+t.pillMonth+' <b>'+(mode==="used"?m.percent:(100-m.percent))+'%</b>';
+    var providers=providerList(data);
+    if(!providers.length){
+      var a0=pickAccount(data);
+      if(!a0||!hasData(a0)){ inner.textContent="—"; return; }
+      providers=["opencode-go"];
+    }
+    var mode=getMode(), parts=[], titleLines=[];
+    for(var i=0;i<providers.length;i++){
+      var p=providers[i], a=pickAccount(data,p), ws=windowsOf(a);
+      if(!ws.length){ parts.push('<span style="opacity:.5">'+esc(providerName(p))+' —</span>'); continue; }
+      var segs=[], shown=0;
+      for(var j=0;j<ws.length&&shown<3;j++){
+        var w=ws[j];
+        if(w.pill===false) continue;
+        if(w.kind==="percent"&&w.percent!=null){
+          segs.push(dot(w.percent)+'<span style="opacity:.6">'+esc(shortLabel(w))+'</span> <b>'+(mode==="used"?w.percent:(100-w.percent))+'%</b>');
+          shown++;
+        } else if((w.kind==="money"||w.kind==="budget")&&w.value!=null){
+          segs.push('<span style="opacity:.6">'+esc(shortLabel(w))+'</span> <b>'+esc(fmtMoney(w.value,w.unit))+'</b>');
+          shown++;
+        }
+      }
+      var multiAcct=accountsOf(data,p).length>1;
+      var head=(providers.length>1||multiAcct)?
+        '<span style="opacity:.55;max-width:70px;overflow:hidden;text-overflow:ellipsis">'+
+        esc(providers.length>1?providerName(p):((a&&a.name)||""))+'</span><span style="opacity:.25">·</span>':"";
+      parts.push(head+segs.join('<span style="opacity:.25;margin:0 5px">·</span>'));
+      var pline=providerName(p)+" "+ws.filter(function(x){ return x.kind==="percent"&&x.percent!=null; })
+        .map(function(x){ return shortLabel(x)+" "+x.percent+"%"; }).join(" | ");
+      titleLines.push((a&&a.name?("["+a.name+"] "):"")+pline);
+    }
+    inner.innerHTML=parts.join('<span style="opacity:.25;margin:0 6px">|</span>');
     Array.from(inner.querySelectorAll("b")).forEach(function(b){ b.style.fontWeight="600"; b.style.color="var(--foreground,#111)"; });
     var age=dataAgeMin();
     // 数据过期（>3分钟）药丸变淡，悬停说明
     quotaEl.style.opacity=(age!=null&&age>3)?".45":"";
-    quotaEl.title=(acct.name?("["+acct.name+"] "):"")+"5h "+t.usedWord+" "+r.percent+"% | "+t.pillWeek+" "+w.percent+"% | "+t.pillMonth+" "+m.percent+"%"
-      +" — "+t.openDetail+"，"+t.foldHint+(age!=null&&age>3?(" · "+t.stale(age)):"");
-    maybeAlert(acct, r.percent);
+    quotaEl.title=titleLines.join("  ·  ")+" — "+t.openDetail+"，"+t.foldHint+(age!=null&&age>3?(" · "+t.stale(age)):"");
+    applyAlerts(data);
     applyFold();
     if(popup && popup.style.display!=="none") renderPopup();
   }
@@ -259,27 +397,57 @@
     });
     return p;
   }
+  function burnHtml(w){
+    if(!w.burn||w.burn.perHour==null) return "";
+    var t=S(), rate=w.burn.perHour, txt;
+    if(w.kind==="percent") txt=(rate>0?"↑":"↓")+Math.abs(rate)+"%"+t.perHourSuffix;
+    else txt=(rate>0?"↑":"↓")+fmtMoney(Math.abs(rate),w.unit)+t.perHourSuffix;
+    var out='<span style="opacity:.65">'+esc(txt)+'</span>';
+    if(w.burn.runOutAt) out+='<span style="opacity:.6;margin-left:10px">'+esc(t.drainOut(countdown(w.burn.runOutAt)))+'</span>';
+    else out+='<span style="opacity:.45;margin-left:10px">'+esc(t.noRunOut)+'</span>';
+    return '<div style="padding:0 0 4px 60px;font-size:11px">'+out+'</div>';
+  }
   function rowHtml(label, w){
     var mode=getMode();
-    var dotC=w.percent>=90?"#ef4444":w.percent>=70?"#eab308":"#22c55e";
-    var bar='<span style="display:inline-block;width:64px;height:5px;background:rgba(127,127,127,0.2);border-radius:99px;vertical-align:middle;overflow:hidden"><span style="display:block;width:'+w.percent+'%;height:100%;background:'+dotC+'"></span></span>';
-    return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--border,rgba(0,0,0,0.06))">'
-      +'<span style="width:52px;color:var(--muted-foreground,#71717a)">'+label+'</span>'
+    var pct=(w.kind==="percent")?w.percent:((w.kind==="budget"&&w.limit)?Math.round(w.value/w.limit*100):null);
+    var bar=pct!=null?
+      '<span style="display:inline-block;width:64px;height:5px;background:rgba(127,127,127,0.2);border-radius:99px;vertical-align:middle;overflow:hidden"><span style="display:block;width:'+Math.min(100,Math.max(0,pct))+'%;height:100%;background:'+colorFor(pct)+'"></span></span>'
+      :'<span style="display:inline-block;width:64px"></span>';
+    var val;
+    if(w.kind==="percent") val=numLine(w.percent, mode);
+    else if(w.kind==="budget") val='<b>'+esc(fmtMoney(w.value,w.unit))+'</b>'+(w.limit!=null?(' <span style="opacity:.55">/ '+esc(fmtMoney(w.limit,w.unit))+'</span>'):'');
+    else if(w.kind==="money") val='<b>'+esc(fmtMoney(w.value,w.unit))+'</b>';
+    else val='<b>'+esc(String(w.value==null?"—":w.value))+'</b>';
+    var reset=w.resetsAt?(fmtDate(w.resetsAt)+'<br>'+countdown(w.resetsAt)):'';
+    return '<div style="border-top:1px solid var(--border,rgba(0,0,0,0.06))">'
+      +'<div style="display:flex;align-items:center;gap:8px;padding:5px 0">'
+      +'<span style="width:52px;color:var(--muted-foreground,#71717a)">'+esc(label)+'</span>'
       +bar
-      +'<span style="min-width:76px;text-align:right">'+numLine(w.percent, mode)+'</span>'
+      +'<span style="min-width:76px;text-align:right">'+val+'</span>'
       +'<span style="flex:1"></span>'
-      +'<span style="text-align:right;color:var(--muted-foreground,#71717a);font-size:11px">'+fmtDate(w.resetsAt)+'<br>'+countdown(w.resetsAt)+'</span>'
-      +'</div>';
+      +'<span style="text-align:right;color:var(--muted-foreground,#71717a);font-size:11px">'+reset+'</span>'
+      +'</div>'+burnHtml(w)+'</div>';
   }
-  // 24h 曲线：当前账号 rolling% 迷你 SVG
-  function sparkHtml(acctName){
+  // 24h 曲线：当前账号主窗口迷你 SVG（provider 感知，金额窗口显示单位）
+  function sparkHtml(acct){
     var t=S();
     if(!histCache||!histCache.length) return '<div style="opacity:.5;font-size:11px;padding:4px 0">'+t.collecting+'</div>';
+    var name=(acct&&acct.name)||"", prov=acct?providerOf(acct):"opencode-go";
+    var ws=windowsOf(acct);
+    var prim=null;
+    for(var x=0;x<ws.length;x++){ if(ws[x].primary){ prim=ws[x]; break; } }
+    if(!prim&&ws.length) prim=ws[0];
+    var unit=prim?prim.unit:null, isPct=!prim||prim.kind==="percent";
     var vals=[];
     for(var i=0;i<histCache.length;i++){
       var pts=histCache[i].a||[];
       for(var j=0;j<pts.length;j++){
-        if(pts[j].n===acctName&&pts[j].r!=null){ vals.push(pts[j].r); break; }
+        var pt=pts[j];
+        if(pt.n!==name) continue;
+        var pp=pt.p;
+        if(pp==null? prov!=="opencode-go" : pp!==prov) continue;
+        if(pt.r!=null) vals.push(pt.r);
+        break;
       }
     }
     vals=vals.slice(-1440);
@@ -292,8 +460,9 @@
       var y=(H-4-((v-min)/span)*(H-10)).toFixed(1);
       return x+","+y;
     }).join(" ");
+    var peak=isPct?t.hMax(max):t.hPeak(fmtMoney(max,unit));
     return '<div style="padding:6px 0 2px;border-top:1px solid var(--border,rgba(0,0,0,0.06))">'
-      +'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted-foreground,#71717a);margin-bottom:2px"><span>'+t.h24+'</span><span>'+t.hMax(max)+'</span></div>'
+      +'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted-foreground,#71717a);margin-bottom:2px"><span>'+t.h24+'</span><span>'+esc(peak)+'</span></div>'
       +'<svg viewBox="0 0 '+W+' '+H+'" style="display:block;width:100%;height:40px"><polyline points="'+d+'" fill="none" stroke="var(--primary,#71717a)" stroke-width="1.5"/></svg></div>';
   }
   function renderPopup(){
@@ -307,35 +476,51 @@
         keepForm={ open:true,
           name:(_f.querySelector('[data-in="name"]')||{}).value||"",
           key:(_f.querySelector('[data-in="key"]')||{}).value||"",
+          prov:(_f.querySelector('[data-in="provider"]')||{}).value||"",
           err:((_f.querySelector('[data-form-err]')||{}).textContent||"") };
       }
     }catch(e){}
-    var acct=pickAccount(cache);
-    if(!acct || !acct.usage) { popup.innerHTML='<div style="opacity:.6">'+t.noData+'</div>'; return; }
-    var list=cache.accounts||[];
+    var providers=providerList(cache);
+    if(!providers.length){ popup.innerHTML='<div style="opacity:.6">'+t.noData+'</div>'; return; }
+    var activeP=activeProvider(cache);
+    var acct=pickAccount(cache, activeP);
+    var list=accountsOf(cache, activeP);
     var mode=getMode();
     var html="";
     var addBtnHtml='<span data-act="add-form" title="'+t.addKey+'" style="cursor:pointer;font-size:14px;line-height:1;opacity:.6;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center">＋</span>';
-    // 账号 Tab
+    // provider Tab（多供应商时）
+    if(providers.length>1){
+      html+='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
+      providers.forEach(function(p){
+        var act=p===activeP, bad=!accountsOf(cache,p).some(hasData);
+        html+='<span data-prov="'+esc(p)+'" style="cursor:pointer;font-size:11px;border-radius:99px;border:1px solid var(--border,rgba(0,0,0,0.1));padding:3px 10px;'
+          +(act?'background:var(--primary,#111);color:var(--primary-foreground,#fff);border-color:transparent;font-weight:600;':'opacity:'+(bad?'0.4':'0.75'))
+          +'">'+esc(providerName(p))+'</span>';
+      });
+      html+='</div>';
+    }
+    // 账号 Tab（当前 provider 下 >1 个时）
     if(list.length>1){
       html+='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
       list.forEach(function(a){
-        var active=a.name===acct.name;
-        var bad=!a.usage;
+        var active=acct&&a.name===acct.name;
+        var bad=!hasData(a);
         html+='<span style="display:inline-flex;align-items:center;font-size:11px;border-radius:99px;border:1px solid var(--border,rgba(0,0,0,0.1));'
           +(active?'background:var(--primary,#111);color:var(--primary-foreground,#fff);border-color:transparent;font-weight:600;':'opacity:'+(bad?'0.4':'0.75'))
           +'">'
           +'<span data-acct="'+esc(a.name)+'" style="cursor:pointer;padding:3px 4px 3px 10px">'+esc(a.name)+(bad?' ✕':'')+'</span>'
-          +'<span data-del="'+esc(a.name)+'" title="'+t.delAcct+'" style="cursor:pointer;padding:3px 8px 3px 2px;opacity:.6">×</span>'
+          +'<span data-del="'+esc(a.name)+'" data-del-prov="'+esc(activeP)+'" title="'+t.delAcct+'" style="cursor:pointer;padding:3px 8px 3px 2px;opacity:.6">×</span>'
           +'</span>';
       });
       html+='</div>';
-    } else if(acct.name){
-      html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-weight:650">⚡ '+esc(acct.name)+' <span style="opacity:.45;font-weight:400">opencode-go</span></span><span style="flex:1"></span>'+addBtnHtml+'</div>';
     } else {
-      html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-weight:650">⚡ opencode-go</span><span style="flex:1"></span>'+addBtnHtml+'</div>';
+      html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-weight:650">⚡ '+esc(acct&&acct.name?acct.name+" ":"")+'<span style="opacity:.45;font-weight:400">'+esc(providerName(activeP))+'</span></span><span style="flex:1"></span>'+addBtnHtml+'</div>';
     }
+    var provSelect=providers.length>1?('<select data-in="provider" style="width:100%;box-sizing:border-box;margin-bottom:6px;font-size:12px;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
+      +providers.map(function(p){ return '<option value="'+esc(p)+'"'+(p===activeP?' selected':'')+'>'+esc(providerName(p))+'</option>'; }).join("")
+      +'</select>'):"";
     html+='<div data-form="add" style="display:none;margin-bottom:8px;padding:8px;border:1px dashed var(--border,rgba(0,0,0,0.15));border-radius:8px">'
+      +provSelect
       +'<input data-in="name" placeholder="'+esc(t.aliasPh)+'" maxlength="32" style="width:100%;box-sizing:border-box;margin-bottom:6px;font-size:12px;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
       +'<input data-in="key" placeholder="sk-..." autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;margin-bottom:6px;font:11px ui-monospace,monospace;padding:4px 8px;border:1px solid var(--border,rgba(0,0,0,0.15));border-radius:6px;background:transparent;color:inherit;outline:none">'
       +'<div data-form-err style="display:none;color:#f87171;font-size:11px;margin-bottom:6px"></div>'
@@ -343,11 +528,11 @@
       +'<span data-act="add-cancel" style="cursor:pointer;font-size:11px;padding:2px 10px;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;opacity:.7">'+t.cancel+'</span>'
       +'<span data-act="add-save" style="cursor:pointer;font-size:11px;padding:2px 10px;border-radius:99px;background:var(--primary,#111);color:var(--primary-foreground,#fff)">'+t.save+'</span>'
       +'</div></div>';
-    var u=acct.usage;
-    if(acct.error || !u.rolling){ html+='<div style="color:#f87171">'+esc(noDataAcct(acct.error||"unknown"))+'</div>'; }
+    var ws=windowsOf(acct);
+    if(acct.error || !ws.length){ html+='<div style="color:#f87171">'+esc(noDataAcct(acct.error||"unknown"))+'</div>'; }
     else{
-      html+=rowHtml(t.w5h, u.rolling)+rowHtml(t.wWeek, u.weekly)+rowHtml(t.wMonth, u.monthly);
-      html+=sparkHtml(acct.name);
+      ws.forEach(function(w){ if(w.kind!=="count") html+=rowHtml(L(w.label), w); });
+      html+=sparkHtml(acct);
     }
     // 右下角平时只显示抓取时刻 HH:MM；数据过期（>3 分钟）才标 stale
     var age=dataAgeMin();
@@ -369,16 +554,21 @@
         var _f2=popup.querySelector('[data-form="add"]');
         if(_f2){
           _f2.style.display="";
-          var _n=_f2.querySelector('[data-in="name"]'), _k=_f2.querySelector('[data-in="key"]'), _e=_f2.querySelector('[data-form-err]');
+          var _n=_f2.querySelector('[data-in="name"]'), _k=_f2.querySelector('[data-in="key"]'),
+              _e=_f2.querySelector('[data-form-err]'), _p=_f2.querySelector('[data-in="provider"]');
           if(_n) _n.value=keepForm.name;
           if(_k) _k.value=keepForm.key;
+          if(_p&&keepForm.prov) _p.value=keepForm.prov;
           if(_e&&keepForm.err){ _e.textContent=keepForm.err; _e.style.display=""; }
         }
       }
     }catch(e2){}
     // 绑定
     Array.from(popup.querySelectorAll("[data-acct]")).forEach(function(s){
-      s.addEventListener("click", function(e){ e.stopPropagation(); localStorage.setItem(LS_ACCT, s.getAttribute("data-acct")); render(cache); });
+      s.addEventListener("click", function(e){ e.stopPropagation(); setAcctSel(activeP, s.getAttribute("data-acct")); render(cache); });
+    });
+    Array.from(popup.querySelectorAll("[data-prov]")).forEach(function(s){
+      s.addEventListener("click", function(e){ e.stopPropagation(); try{ localStorage.setItem(LS_PROVIDER, s.getAttribute("data-prov")); }catch(e2){} renderPopup(); });
     });
     var tm=popup.querySelector('[data-act="toggle-mode"]');
     if(tm) tm.addEventListener("click", function(e){ e.stopPropagation(); localStorage.setItem(LS_MODE, getMode()==="used"?"left":"used"); render(cache); });
@@ -396,9 +586,12 @@
       var errEl=form.querySelector('[data-form-err]');
       var name=nameEl?nameEl.value.trim():"", key=keyEl?keyEl.value.trim():"";
       if(!name || !key){ if(errEl){ errEl.textContent=t.needBoth; errEl.style.display=""; } return; }
+      var provEl=form.querySelector('[data-in="provider"]');
+      var provider=provEl&&provEl.value?provEl.value:activeP;
       saveBtn.textContent=t.checking;
-      apiCall("POST", "/api/accounts", { name:name, apiKey:key }).then(function(){
-        localStorage.setItem(LS_ACCT, name);
+      apiCall("POST", "/api/accounts", { name:name, apiKey:key, provider:provider }).then(function(){
+        setAcctSel(provider, name);
+        try{ localStorage.setItem(LS_PROVIDER, provider); }catch(e0){}
         refresh();
       }).catch(function(err){
         if(errEl){ errEl.textContent=String(err.message||err); errEl.style.display=""; }
@@ -409,9 +602,11 @@
       x.addEventListener("click", function(e){
         e.stopPropagation();
         var nm=x.getAttribute("data-del");
+        var dprov=x.getAttribute("data-del-prov")||activeP;
         if(!confirm(delConfirm(nm))) return;
-        apiCall("DELETE", "/api/accounts?name="+encodeURIComponent(nm)).then(function(){
-          if(getAcct()===nm) localStorage.removeItem(LS_ACCT);
+        apiCall("DELETE", "/api/accounts?name="+encodeURIComponent(nm)+"&provider="+encodeURIComponent(dprov)).then(function(){
+          var sel=getAcctSel();
+          if(sel.name===nm&&sel.provider===dprov) localStorage.removeItem(LS_ACCT);
           refresh();
         }).catch(function(err){ alert(delFail(err.message||err)); });
       });

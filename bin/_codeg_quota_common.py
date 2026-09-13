@@ -6,9 +6,11 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import sys
 
 IS_MACOS = sys.platform == "darwin"
+DEFAULT_PROVIDER = "opencode-go"
 
 
 def home():
@@ -74,22 +76,7 @@ def fallback_key_files():
     ]
 
 
-def load_accounts():
-    """返回 [(name, api_key)]。
-
-    账号文件存在且可解析时以其为准——空列表就是空（保证"删除最后一个账号"生效），
-    仅当文件不存在或损坏时才回退到配置文件里的单 key。
-    """
-    f = accounts_file()
-    if f.exists():
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-            if isinstance(d, list):
-                return [(x.get("name", "账号%d" % (i + 1)), x.get("apiKey", ""))
-                        for i, x in enumerate(d) if isinstance(x, dict) and x.get("apiKey")]
-            print("opencode-quota: accounts file is not a list, using fallback", file=sys.stderr)
-        except (OSError, ValueError) as e:
-            print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
+def _fallback_keys():
     for p in fallback_key_files():
         try:
             t = p.read_text(encoding="utf-8")
@@ -104,6 +91,98 @@ def load_accounts():
     return []
 
 
+def _accounts_from_section(accounts):
+    return [(x.get("name", "账号%d" % (i + 1)), x.get("apiKey", ""))
+            for i, x in enumerate(accounts) if isinstance(x, dict) and x.get("apiKey")]
+
+
+def _parse_config_text(text):
+    """-> v2 配置 dict（v1 裸列表升级为 opencode-go 段）；无法识别返回 None。"""
+    d = json.loads(text)
+    if isinstance(d, list):
+        provs = [{"type": DEFAULT_PROVIDER, "accounts": d, "options": {}}] if d else []
+        return {"version": 2, "providers": provs}
+    if isinstance(d, dict) and isinstance(d.get("providers"), list):
+        return d
+    return None
+
+
+def load_config():
+    """读配置（v1 自动升级为内存 v2）。文件缺失/损坏返回空配置（不回退 key 文件）。"""
+    f = accounts_file()
+    if not f.exists():
+        return {"version": 2, "providers": []}
+    try:
+        cfg = _parse_config_text(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
+        return {"version": 2, "providers": []}
+    if cfg is None:
+        print("opencode-quota: accounts file has unknown shape", file=sys.stderr)
+        return {"version": 2, "providers": []}
+    return cfg
+
+
+def provider_accounts(cfg, type_id):
+    for p in cfg.get("providers", []):
+        if isinstance(p, dict) and p.get("type") == type_id:
+            return p.get("accounts") or []
+    return []
+
+
+def load_accounts(provider=DEFAULT_PROVIDER):
+    """返回 [(name, api_key)]（兼容旧签名）。
+
+    文件存在且可解析时以其为准——空列表就是空（保证"删除最后一个账号"生效）；
+    仅当文件不存在/损坏，且是默认 provider 时，才回退到配置文件里的单 key。
+    """
+    f = accounts_file()
+    if f.exists():
+        try:
+            cfg = _parse_config_text(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print("opencode-quota: accounts file error: %s" % e, file=sys.stderr)
+            cfg = None
+        if cfg is not None:
+            return _accounts_from_section(provider_accounts(cfg, provider))
+    if provider == DEFAULT_PROVIDER:
+        return _fallback_keys()
+    return []
+
+
+def save_accounts(acc, provider=DEFAULT_PROVIDER):
+    """写回指定 provider 的账号段落（段落合并，保留其他 provider；v1→v2 前先备份）。"""
+    f = accounts_file()
+    cfg = None
+    if f.exists():
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(d, list):
+                bak = f.with_name(f.name + ".v1.bak")
+                if not bak.exists():
+                    shutil.copy2(f, bak)
+                cfg = {"version": 2, "providers":
+                       [{"type": DEFAULT_PROVIDER, "accounts": d, "options": {}}] if d else []}
+            elif isinstance(d, dict) and isinstance(d.get("providers"), list):
+                cfg = d
+        except (OSError, ValueError):
+            cfg = None
+    if cfg is None:
+        cfg = {"version": 2, "providers": []}
+    cfg.setdefault("version", 2)
+    provs = cfg.setdefault("providers", [])
+    section = None
+    for p in provs:
+        if isinstance(p, dict) and p.get("type") == provider:
+            section = p
+            break
+    if section is None:
+        section = {"type": provider, "accounts": [], "options": {}}
+        provs.append(section)
+    section["accounts"] = [{"name": n, "apiKey": k} for n, k in acc]
+    atomic_write_text(f, json.dumps(cfg, ensure_ascii=False, indent=2), mode=0o600)
+
+
 def atomic_write_text(path, text, mode=None):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,14 +193,6 @@ def atomic_write_text(path, text, mode=None):
     if mode is not None:
         os.chmod(tmp, mode)
     os.replace(tmp, path)
-
-
-def save_accounts(acc):
-    """写账号文件（原子 + 600）。"""
-    atomic_write_text(
-        accounts_file(),
-        json.dumps([{"name": n, "apiKey": k} for n, k in acc], ensure_ascii=False, indent=2),
-        mode=0o600)
 
 
 def safe_int(name, default, minimum=None):
@@ -148,3 +219,48 @@ def write_targets(basename):
     if wr.is_dir() and wr.resolve() != data_dir().resolve():
         dirs.append(wr)
     return [d / basename for d in dirs]
+
+
+def codeg_db_path():
+    """codeg 主数据库路径（供只读查询）。"""
+    env = os.environ.get("CODEG_DB")
+    if env:
+        return pathlib.Path(env)
+    if IS_MACOS:
+        cands = [home() / "Library/Application Support/app.codeg/codeg.db",
+                 home() / "Library/Application Support/codeg/codeg.db"]
+    else:
+        cands = [home() / ".local/share/codeg/codeg.db",
+                 home() / ".codeg/codeg.db"]
+    for c in cands:
+        if c.is_file():
+            return c
+    return cands[0]
+
+
+def read_codeg_service():
+    """从 codeg.db app_metadata 读 (web_service_port, web_service_token)；失败 (None, None)。
+
+    必须用 mode=ro（不能加 immutable=1，否则读不到 WAL 里的最新值）。
+    """
+    p = codeg_db_path()
+    if not p.is_file():
+        return (None, None)
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % p, uri=True, timeout=2)
+        try:
+            rows = dict(con.execute(
+                "SELECT key, value FROM app_metadata "
+                "WHERE key IN ('web_service_port','web_service_token')").fetchall())
+        finally:
+            con.close()
+        try:
+            port = int(rows.get("web_service_port") or 0) or None
+        except (TypeError, ValueError):
+            port = None
+        token = (rows.get("web_service_token") or "").strip() or None
+        return (port, token)
+    except Exception as e:
+        print("opencode-quota: codeg.db read failed: %s" % e, file=sys.stderr)
+        return (None, None)

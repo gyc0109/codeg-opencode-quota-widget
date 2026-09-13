@@ -1,47 +1,158 @@
 #!/usr/bin/env python3
-"""多账号版 opencode-go 额度抓取：循环拉每个账号的 /usage，合并写入 opencode-quota.json
+"""多供应商额度抓取：按 provider 适配器拉取，合并写入 opencode-quota.json
 
-输出位置：data 目录（api 读取）+ web 静态根（存在时镜像，供前端同源 fetch）。
+- 输出：data 目录（api 读取）+ web 静态根（存在时镜像）
+- 兼容：opencode-go 保留旧 usage 三件套镜像与顶层 usage；历史行保留 r/w/m 旧字段
+- 调度：每 provider 有自己的刷新间隔（适配器 default_interval_s；OPENCODE_QUOTA_INTERVAL 可统一覆盖）
+- --once 全量抓取；--print-json 只输出不落盘（测试用）
 """
 import json
 import os
+import pathlib
 import sys
 import time
-import urllib.request
-import pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _codeg_quota_common as common  # noqa: E402
+import _codeg_quota_providers as providers  # noqa: E402
 
-HISTORY_KEEP = 1500  # 约 25 小时（60s 间隔）
-HISTORY_CHECK_EVERY = 30  # 每 N 轮才做一次截尾检查（读全文件有成本）
-URL = "https://opencode.ai/zen/go/v1/usage"
-INTERVAL = common.safe_int("OPENCODE_QUOTA_INTERVAL", 60, minimum=5)
-
-
-def fetch(key):
-    req = urllib.request.Request(URL, headers={
-        "Authorization": "Bearer " + key,
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
-    })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode())
+HISTORY_KEEP = 1500   # 约 25 小时（60s 间隔）
+HISTORY_CHECK_EVERY = 30
+LEGACY_KEYS = {"rolling": "r", "weekly": "w", "monthly": "m"}
+BURN_SPAN_MAX_H = 3.0     # 燃烧率只用最近 3 小时样本
+BURN_MIN_SPAN_H = 0.25    # 至少 15 分钟跨度
+BURN_MIN_SAMPLES = 5
+INTERVAL_OVERRIDE = common.safe_int("OPENCODE_QUOTA_INTERVAL", 0, minimum=5) or None
 
 
-def append_history(accounts, tick):
-    """用量快照 append 到 jsonl，供前端画 24h 曲线；定期截尾。"""
-    line = {"t": int(time.time()), "a": [
-        {"n": a.get("name", "?"),
-         "r": (a.get("usage") or {}).get("rolling", {}).get("percent"),
-         "w": (a.get("usage") or {}).get("weekly", {}).get("percent"),
-         "m": (a.get("usage") or {}).get("monthly", {}).get("percent")}
-        for a in accounts]}
+def history_path():
+    return common.write_targets("opencode-quota-history.jsonl")[0]
+
+
+def history_tail(max_bytes=65536):
+    """读历史文件尾部 -> [row dict]（截断容忍）。"""
+    try:
+        f = open(history_path(), "rb")
+    except OSError:
+        return []
+    with f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read().decode("utf-8", "replace")
+    lines = data.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(o, dict) and o.get("t"):
+            out.append(o)
+    return out
+
+
+def series_for(history, provider, name, win_id, legacy_key=None):
+    """某 (provider, 账号, 窗口) 的历史值序列 [(t, v)]；旧格式行用 r/w/m 回退。"""
+    pts = []
+    for row in history:
+        t = row.get("t")
+        for pt in row.get("a") or []:
+            if pt.get("n") != name:
+                continue
+            p = pt.get("p")
+            if p is None:
+                if provider != "opencode-go":
+                    continue
+            elif p != provider:
+                continue
+            v = None
+            x = pt.get("x") or {}
+            if x.get(win_id) is not None:
+                v = x.get(win_id)
+            elif legacy_key and pt.get(legacy_key) is not None:
+                v = pt.get(legacy_key)
+            if v is not None:
+                try:
+                    pts.append((float(t), float(v)))
+                except (TypeError, ValueError):
+                    pass
+    return pts
+
+
+def burn_rate(pts, kind, direction):
+    """-> {"perHour": x, "runOutAt": iso|None} 或 None（样本不足）。"""
+    now = time.time()
+    recent = [(t, v) for t, v in pts if 0 <= now - t <= BURN_SPAN_MAX_H * 3600]
+    if len(recent) < BURN_MIN_SAMPLES:
+        return None
+    t0, v0 = recent[0]
+    t1, v1 = recent[-1]
+    span_h = (t1 - t0) / 3600.0
+    if span_h < BURN_MIN_SPAN_H:
+        return None
+    rate = (v1 - v0) / span_h
+    run_out = None
+    if kind == "percent" and direction == "used" and rate > 0.01:
+        run_out = now + max(0.0, 100.0 - v1) / rate * 3600
+    elif direction == "left" and rate < -0.001:
+        run_out = now + max(0.0, v1) / (-rate) * 3600
+    out = {"perHour": round(rate, 3)}
+    if run_out is not None and (run_out - now) < 30 * 86400:
+        out["runOutAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_out))
+    return out
+
+
+def attach_burn(entries, history):
+    for e in entries:
+        if e.get("error"):
+            continue
+        for w in e.get("windows") or []:
+            pts = series_for(history, e.get("provider"), e.get("name"),
+                             w.get("id"), LEGACY_KEYS.get(w.get("id")))
+            b = burn_rate(pts, w.get("kind"), w.get("direction"))
+            if b:
+                w["burn"] = b
+
+
+def history_row(entries):
+    """history 行：新字段 p/x + 旧字段 r/w/m（r=主窗口值，旧 sparkline 用）。"""
+    a = []
+    for e in entries:
+        if e.get("error"):
+            continue
+        row = {"n": e.get("name"), "p": e.get("provider")}
+        x = {}
+        prim_val = None
+        for w in e.get("windows") or []:
+            v = w.get("percent") if w.get("kind") == "percent" else w.get("value")
+            if v is not None:
+                x[w["id"]] = v
+            if w.get("primary") and v is not None:
+                prim_val = v
+        if x:
+            row["x"] = x
+        if prim_val is not None:
+            row["r"] = prim_val
+        u = e.get("usage")
+        if e.get("provider") == "opencode-go" and isinstance(u, dict):
+            row["w"] = (u.get("weekly") or {}).get("percent")
+            row["m"] = (u.get("monthly") or {}).get("percent")
+        a.append(row)
+    return {"t": int(time.time()), "a": a}
+
+
+def append_history(row, tick):
     for path in common.write_targets("opencode-quota-history.jsonl"):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
             if tick % HISTORY_CHECK_EVERY != 0:
                 continue
             with open(path, encoding="utf-8") as f:
@@ -53,46 +164,84 @@ def append_history(accounts, tick):
             print("opencode-quota: history write failed (%s): %s" % (path, e), file=sys.stderr)
 
 
-def once(tick=0):
-    acc = common.load_accounts()
-    if not acc:
-        print("opencode-quota: no accounts", file=sys.stderr)
-        return False
-    out = {"accounts": []}
-    ok = fail = 0
-    for name, key in acc:
+def load_prev_accounts():
+    for p in common.write_targets("opencode-quota.json"):
         try:
-            data = fetch(key)
-            usage = data.get("usage", data)
-            out["accounts"].append({"name": name, "usage": usage})
-            ok += 1
-        except Exception as e:
-            out["accounts"].append({"name": name, "error": str(e)[:120]})
-            fail += 1
-            print("opencode-quota: [%s] failed: %s" % (name, e), file=sys.stderr)
-    out["_fetchedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    # 兼容：单账号时同时保留顶层 usage（老前端可用）
-    if len(out["accounts"]) == 1 and "usage" in out["accounts"][0]:
-        out["usage"] = out["accounts"][0]["usage"]
+            if p.is_file():
+                d = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(d, dict):
+                    return d.get("accounts") or []
+        except (OSError, ValueError):
+            continue
+    return []
+
+
+def refresh(only_types=None, dry_run=False, tick=0):
+    cfg = common.load_config()
+    fetched = providers.build_account_entries(cfg, only_types)
+    fetched_types = set(e.get("provider") for e in fetched)
+    order = [p.get("type") for p in cfg.get("providers", [])]
+    # 本轮未刷新的 provider 沿用上次输出；旧格式条目（无 provider 字段）视为默认 provider
+    kept = []
+    for e in load_prev_accounts():
+        p = e.get("provider") or common.DEFAULT_PROVIDER
+        if p in fetched_types or p not in order:
+            continue
+        e["provider"] = p
+        kept.append(e)
+    entries = kept + fetched
+    entries.sort(key=lambda e: order.index(e.get("provider"))
+                 if e.get("provider") in order else 999)
+    attach_burn(entries, history_tail())
+    out = {"schema": 2, "accounts": entries,
+           "_fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if len(entries) == 1 and entries[0].get("usage"):
+        out["usage"] = entries[0]["usage"]
+    if dry_run:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return True
     payload = json.dumps(out, ensure_ascii=False)
     for path in common.write_targets("opencode-quota.json"):
         try:
             common.atomic_write_text(path, payload)
         except OSError as e:
             print("opencode-quota: write failed (%s): %s" % (path, e), file=sys.stderr)
-    append_history(out["accounts"], tick)
-    print("opencode-quota: ok=%d fail=%d accounts=%d" % (ok, fail, len(acc)), flush=True)
+    if fetched:
+        append_history(history_row(fetched), tick)
+    ok = sum(1 for e in entries if not e.get("error"))
+    fail = sum(1 for e in entries if e.get("error"))
+    print("opencode-quota: ok=%d fail=%d accounts=%d" % (ok, fail, len(entries)), flush=True)
     return fail == 0 or ok > 0
 
 
+def due_types(last_run):
+    now = time.time()
+    cfg = common.load_config()
+    due = set()
+    for prov in cfg.get("providers", []):
+        ptype = prov.get("type")
+        adapter = providers.get_adapter(ptype)
+        interval = INTERVAL_OVERRIDE or (adapter.default_interval_s if adapter else 60)
+        if now - last_run.get(ptype, 0) >= interval:
+            due.add(ptype)
+    return due
+
+
 if __name__ == "__main__":
+    if "--print-json" in sys.argv:
+        sys.exit(0 if refresh(dry_run=True) else 1)
     if "--once" in sys.argv:
-        sys.exit(0 if once() else 1)
+        sys.exit(0 if refresh() else 1)
+    last_run = {}
     tick = 0
     while True:
         try:
-            once(tick)
+            due = due_types(last_run)
+            if due:
+                refresh(only_types=due, tick=tick)
+                for t in due:
+                    last_run[t] = time.time()
         except Exception as e:
             print("opencode-quota: loop error: %s" % e, file=sys.stderr)
         tick += 1
-        time.sleep(INTERVAL)
+        time.sleep(15)

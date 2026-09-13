@@ -36,7 +36,7 @@ clang -fobjc-arc -framework Cocoa -framework WebKit -o /tmp/codeg-quota-test-hos
 
 echo "==> 运行（注入 dylib，5 秒后截图）"
 CODEG_QUOTA_FORCE=1 \
-CODEG_QUOTA_JS_FILE="$LIB/opencode-quota.js" \
+CODEG_QUOTA_JS_FILE="${CODEG_QUOTA_JS_FILE:-$LIB/opencode-quota.js}" \
 DYLD_INSERT_LIBRARIES="$LIB/libcodegquota.dylib" \
   /tmp/codeg-quota-test-host
 

@@ -14,6 +14,8 @@
 		<string>@@WEBROOT@@</string>
 		<key>CODEG_TOKEN</key>
 		<string>@@TOKEN@@</string>
+		<key>CODEG_PORT</key>
+		<string>@@SERVERPORT@@</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
