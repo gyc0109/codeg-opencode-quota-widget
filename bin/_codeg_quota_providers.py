@@ -150,8 +150,11 @@ def get_adapter(type_id):
     return ADAPTERS.get(type_id)
 
 
-def build_account_entries(providers_cfg, only_types=None):
-    """按配置构建账号输出条目（含 windows/镜像/error）。only_types=None 表示全部。"""
+def build_account_entries(providers_cfg, only_types=None, prev_by_key=None):
+    """按配置构建账号输出条目（含 windows/镜像/error）。only_types=None 表示全部。
+
+    抓取失败时若上次有数据则沿用（保留 windows，标记 stale + error），避免药丸退化成"—"。
+    """
     entries = []
     for prov in providers_cfg.get("providers", []):
         ptype = prov.get("type") or ""
@@ -174,6 +177,13 @@ def build_account_entries(providers_cfg, only_types=None):
                     entry.update(norm["extra"])
                 entries.append(entry)
             except Exception as e:
-                entries.append({"provider": ptype, "name": name,
-                                "error": str(e)[:120]})
+                msg = str(e)[:120]
+                prev = (prev_by_key or {}).get((ptype, name))
+                if prev and prev.get("windows"):
+                    entry = dict(prev)
+                    entry["error"] = msg
+                    entry["stale"] = True
+                    entries.append(entry)
+                else:
+                    entries.append({"provider": ptype, "name": name, "error": msg})
     return entries

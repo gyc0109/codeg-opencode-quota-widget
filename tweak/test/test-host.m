@@ -47,6 +47,45 @@ static NSString *const kMockHTML =
     [self.webView loadRequest:[NSURLRequest requestWithURL:
         [NSURL URLWithString:@"tauri://localhost/index.html"]]];
 
+    // CODEG_QUOTA_TEST_OPEN=1：3 秒时自动点开药丸（弹层截图用）
+    // CODEG_QUOTA_TEST_TAB=src:cc-switch 可先切到指定 tab
+    if (getenv("CODEG_QUOTA_TEST_OPEN")) {
+        const char *tab = getenv("CODEG_QUOTA_TEST_TAB");
+        if (tab && tab[0]) {
+            NSString *js = [NSString stringWithFormat:
+                @"localStorage.setItem('opencode-quota-provider','%s')",
+                tab];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self.webView evaluateJavaScript:js completionHandler:nil];
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self.webView evaluateJavaScript:
+                @"document.getElementById('opencode-quota-inline').click()"
+                completionHandler:nil];
+        });
+    }
+    if (getenv("CODEG_QUOTA_TEST_DEBUG")) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSString *probe =
+                @"(function(){try{var p=document.getElementById('opencode-quota-popup');"
+                 "return 'display='+(p?p.style.display:'null')+' len='+(p?p.innerHTML.length:0)"
+                 "+' top='+(p?p.style.top:'')+' left='+(p?p.style.left:'');}catch(e){return 'ERR '+e.message;}})()";
+            [self.webView evaluateJavaScript:probe
+                           completionHandler:^(id result, NSError *err) {
+                NSLog(@"[debug] popup probe: %@ (err=%@)", result, err.localizedDescription);
+            }];
+            [self.webView evaluateJavaScript:
+                @"(function(){try{return 'provTab='+localStorage.getItem('opencode-quota-provider');}catch(e){return 'lsERR';}})()"
+                           completionHandler:^(id result, NSError *err) {
+                NSLog(@"[debug] %@", result);
+            }];
+        });
+    }
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         WKSnapshotConfiguration *sc = [[WKSnapshotConfiguration alloc] init];

@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import _codeg_quota_common as common  # noqa: E402
 import _codeg_quota_providers as providers  # noqa: E402
+import _codeg_quota_sources as sources  # noqa: E402
 
 HISTORY_KEEP = 1500   # 约 25 小时（60s 间隔）
 HISTORY_CHECK_EVERY = 30
@@ -178,12 +179,16 @@ def load_prev_accounts():
 
 def refresh(only_types=None, dry_run=False, tick=0):
     cfg = common.load_config()
-    fetched = providers.build_account_entries(cfg, only_types)
+    prev_entries = load_prev_accounts()
+    prev_by_key = {}
+    for e in prev_entries:
+        prev_by_key[(e.get("provider") or common.DEFAULT_PROVIDER, e.get("name"))] = e
+    fetched = providers.build_account_entries(cfg, only_types, prev_by_key)
     fetched_types = set(e.get("provider") for e in fetched)
     order = [p.get("type") for p in cfg.get("providers", [])]
     # 本轮未刷新的 provider 沿用上次输出；旧格式条目（无 provider 字段）视为默认 provider
     kept = []
-    for e in load_prev_accounts():
+    for e in prev_entries:
         p = e.get("provider") or common.DEFAULT_PROVIDER
         if p in fetched_types or p not in order:
             continue
@@ -214,6 +219,34 @@ def refresh(only_types=None, dry_run=False, tick=0):
     return fail == 0 or ok > 0
 
 
+def load_prev_sources():
+    for p in common.write_targets("opencode-quota-sources.json"):
+        try:
+            if p.is_file():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def refresh_sources(only_ids=None, dry_run=False):
+    doc = sources.refresh_sources(load_prev_sources(), only_ids)
+    if dry_run:
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
+        return True
+    payload = json.dumps(doc, ensure_ascii=False)
+    for path in common.write_targets("opencode-quota-sources.json"):
+        try:
+            common.atomic_write_text(path, payload)
+        except OSError as e:
+            print("opencode-quota: sources write failed (%s): %s" % (path, e), file=sys.stderr)
+    blocks = doc.get("sources") or {}
+    print("opencode-quota: sources ok=%d stale=%d" % (
+        sum(1 for b in blocks.values() if not b.get("stale")),
+        sum(1 for b in blocks.values() if b.get("stale"))), flush=True)
+    return True
+
+
 def due_types(last_run):
     now = time.time()
     cfg = common.load_config()
@@ -230,9 +263,17 @@ def due_types(last_run):
 if __name__ == "__main__":
     if "--print-json" in sys.argv:
         sys.exit(0 if refresh(dry_run=True) else 1)
+    if "--print-sources" in sys.argv:
+        sys.exit(0 if refresh_sources(dry_run=True) else 1)
     if "--once" in sys.argv:
-        sys.exit(0 if refresh() else 1)
+        ok = refresh()
+        try:
+            refresh_sources()
+        except Exception as e:
+            print("opencode-quota: sources error: %s" % e, file=sys.stderr)
+        sys.exit(0 if ok else 1)
     last_run = {}
+    src_last = {}
     tick = 0
     while True:
         try:
@@ -241,6 +282,11 @@ if __name__ == "__main__":
                 refresh(only_types=due, tick=tick)
                 for t in due:
                     last_run[t] = time.time()
+            sdue = sources.sources_due(src_last)
+            if sdue:
+                refresh_sources(only_ids=sdue)
+                for s in sdue:
+                    src_last[s] = time.time()
         except Exception as e:
             print("opencode-quota: loop error: %s" % e, file=sys.stderr)
         tick += 1

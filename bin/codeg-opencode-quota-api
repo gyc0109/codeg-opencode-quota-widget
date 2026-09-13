@@ -155,6 +155,11 @@ class H(BaseHTTPRequestHandler):
         if path == "/quota-history.jsonl":
             body = local_file("opencode-quota-history.jsonl") or b""
             return self._send_raw(200, body, "text/plain; charset=utf-8")
+        if path == "/quota-sources.json":
+            body = local_file("opencode-quota-sources.json")
+            if body is None:
+                return self._send(404, {"error": "no sources data yet"})
+            return self._send_raw(200, body, "application/json; charset=utf-8")
         if path != "/api/accounts":
             return self._send(404, {"error": "not found"})
         provider = (parse_qs(urlparse(self.path).query).get("provider")

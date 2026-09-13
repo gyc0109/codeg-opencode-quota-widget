@@ -6,6 +6,7 @@
   var IS_WEB=/^https?:$/.test((location.protocol||"").toLowerCase());
   var API_ORIGIN=IS_WEB?(location.protocol+"//"+location.hostname+":3081"):"http://127.0.0.1:3081";
   var JSON_URL=IS_WEB?"/opencode-quota.json":API_ORIGIN+"/quota.json";
+  var SRC_URL=IS_WEB?"/opencode-quota-sources.json":API_ORIGIN+"/quota-sources.json";
   var HIST_URL=IS_WEB?"/opencode-quota-history.jsonl":API_ORIGIN+"/quota-history.jsonl";
   var API_URL="https://opencode.ai/zen/go/v1/usage", REFRESH_MS=60000;
   var LS_ACCT="opencode-quota-account", LS_MODE="opencode-quota-mode", LS_FOLD="opencode-quota-folded"; // mode: left|used
@@ -55,6 +56,14 @@
       perHourSuffix:"/时",
       drainOut:function(c){ return "约"+c+"耗尽"; },
       noRunOut:"暂无耗尽趋势",
+      srcStale:"数据暂不可用",
+      acctStale:"数据为上次成功抓取",
+      statToday:"今日", statHour:"近1小时", stat30d:"近30天", statCache:"缓存读取", statCost:"花费",
+      reqUnit:"请求", errUnit:"错误", turnUnit:"轮", monthWord:"本月",
+      limitDaily:"日限额", limitMonthly:"月限额",
+      perModel:"按模型", perAgent:"按 agent",
+      errRate:function(p){ return "近1小时错误率 "+p+"%"; },
+      alertHealth:function(n,e){ return "["+n+"] 上游异常："+e; },
       h24:"24小时用量",
       hMax:function(p){ return "最高 "+p+"%"; },
       hPeak:function(v){ return "峰值 "+v; }
@@ -84,6 +93,14 @@
       perHourSuffix:"/h",
       drainOut:function(c){ return "runs out ~"+c.replace(" left",""); },
       noRunOut:"no run-out trend",
+      srcStale:"data unavailable",
+      acctStale:"showing last successful fetch",
+      statToday:"Today", statHour:"Last hour", stat30d:"Last 30d", statCache:"Cache read", statCost:"Cost",
+      reqUnit:"req", errUnit:"err", turnUnit:"turns", monthWord:"month",
+      limitDaily:"Daily limit", limitMonthly:"Monthly limit",
+      perModel:"By model", perAgent:"By agent",
+      errRate:function(p){ return p+"% errors in the last hour"; },
+      alertHealth:function(n,e){ return "["+n+"] upstream issue: "+e; },
       h24:"24h usage",
       hMax:function(p){ return "peak "+p+"%"; },
       hPeak:function(v){ return "peak "+v; }
@@ -116,7 +133,7 @@
     }catch(e){ return null; }
   }
 
-  var quotaEl=null, popup=null, cache=null, histCache=null, timerStarted=false;
+  var quotaEl=null, popup=null, cache=null, histCache=null, srcCache=null, timerStarted=false;
   var LS_PROVIDER="opencode-quota-provider";
   function apiBase(){ return API_ORIGIN; }
   function apiToken(){ return localStorage.getItem("codeg_token")||""; }
@@ -243,7 +260,7 @@
   // 每个 key 通知一次；恢复后清除；老版本按账号名的 key 做迁移避免重复通知
   function applyAlerts(data){
     if(!quotaEl) return;
-    var alerts=collectAlerts(data), seen={}, t=S();
+    var alerts=collectAlerts(data).concat(collectSourceAlerts()), seen={}, t=S();
     for(var i=0;i<alerts.length;i++){
       var al=alerts[i];
       seen[al.key]=1;
@@ -257,6 +274,8 @@
       if(al.kind==="pct") body=t.alertPct(al.name||providerName(al.provider), al.win, al.pct);
       else if(al.kind==="below") body=t.alertBelow(al.name||providerName(al.provider), fmtMoney(al.value,al.unit));
       else if(al.kind==="runout") body=t.alertRunOut(al.name||providerName(al.provider), al.win, countdown(al.runOutAt));
+      else if(al.kind==="health") body=t.alertHealth(al.name||"", al.lastError||"");
+      else if(al.kind==="limit") body=t.alertPct(al.name||"", al.win||"", al.pct);
       try{
         if("Notification" in window && Notification.permission==="granted"){ new Notification(t.alert,{body:body}); }
       }catch(e){}
@@ -355,11 +374,13 @@
       var head=(providers.length>1||multiAcct)?
         '<span style="opacity:.55;max-width:70px;overflow:hidden;text-overflow:ellipsis">'+
         esc(providers.length>1?providerName(p):((a&&a.name)||""))+'</span><span style="opacity:.25">·</span>':"";
-      parts.push(head+segs.join('<span style="opacity:.25;margin:0 5px">·</span>'));
+      parts.push(head+segs.join('<span style="opacity:.25;margin:0 5px">·</span>')+((a&&a.stale)?'<span style="color:#eab308;margin-left:4px">⚠</span>':""));
       var pline=providerName(p)+" "+ws.filter(function(x){ return x.kind==="percent"&&x.percent!=null; })
         .map(function(x){ return shortLabel(x)+" "+x.percent+"%"; }).join(" | ");
       titleLines.push((a&&a.name?("["+a.name+"] "):"")+pline);
     }
+    var hbad=healthSummary();
+    if(hbad) parts.push('<span style="color:#ef4444">● '+hbad+'</span>');
     inner.innerHTML=parts.join('<span style="opacity:.25;margin:0 6px">|</span>');
     Array.from(inner.querySelectorAll("b")).forEach(function(b){ b.style.fontWeight="600"; b.style.color="var(--foreground,#111)"; });
     var age=dataAgeMin();
@@ -465,9 +486,196 @@
       +'<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted-foreground,#71717a);margin-bottom:2px"><span>'+t.h24+'</span><span>'+esc(peak)+'</span></div>'
       +'<svg viewBox="0 0 '+W+' '+H+'" style="display:block;width:100%;height:40px"><polyline points="'+d+'" fill="none" stroke="var(--primary,#71717a)" stroke-width="1.5"/></svg></div>';
   }
+  // ---- 本地数据源（cc-switch / codeg 用量）面板 ----
+  var SOURCE_NAMES={ "cc-switch":{zh:"CC Switch",en:"CC Switch"}, "codeg-usage":{zh:"codeg 用量",en:"codeg usage"} };
+  function sourceName(sid){ var n=SOURCE_NAMES[sid]; return n?L(n):sid; }
+  function sourceTabs(){ try{ return srcCache&&srcCache.sources?Object.keys(srcCache.sources):[]; }catch(e){ return []; } }
+  function srcAgeMin(){
+    try{
+      var f=srcCache&&srcCache._fetchedAt;
+      if(!f) return null;
+      return Math.max(0, Math.round((Date.now()-Date.parse(f))/60000));
+    }catch(e){ return null; }
+  }
+  function healthSummary(){
+    try{
+      var b=srcCache&&srcCache.sources&&srcCache.sources["cc-switch"];
+      if(!b||b.stale) return 0;
+      var bad=0;
+      (b.health||[]).forEach(function(x){ if(x.healthy===false) bad++; });
+      var hr=b.totals&&b.totals.hour;
+      if(hr&&hr.requests>=10&&hr.errorRate>0.2) bad=Math.max(bad,1);
+      return bad;
+    }catch(e){ return 0; }
+  }
+  function fmtTokens(n){
+    n=Number(n)||0;
+    if(n>=1e9) return (n/1e9).toFixed(2)+"B";
+    if(n>=1e6) return (n/1e6).toFixed(1)+"M";
+    if(n>=1e3) return (n/1e3).toFixed(1)+"K";
+    return String(n);
+  }
+  function statRowHtml(rows){
+    var h='<div style="font-size:11px;padding:2px 0 6px">';
+    rows.forEach(function(r){
+      h+='<div style="display:flex;gap:8px;padding:1px 0"><span style="opacity:.55;min-width:64px">'+esc(r[0])+'</span><span>'+esc(r[1])+'</span></div>';
+    });
+    return h+'</div>';
+  }
+  function tabBarHtml(providers, srcIds, activeP, activeSrc){
+    var h='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
+    providers.forEach(function(p){
+      var act=p===activeP, bad=!(cache&&accountsOf(cache,p).some(hasData));
+      h+='<span data-prov="'+esc(p)+'" style="cursor:pointer;font-size:11px;border-radius:99px;border:1px solid var(--border,rgba(0,0,0,0.1));padding:3px 10px;'
+        +(act?'background:var(--primary,#111);color:var(--primary-foreground,#fff);border-color:transparent;font-weight:600;':'opacity:'+(bad?'0.4':'0.75'))+'">'+esc(providerName(p))+'</span>';
+    });
+    srcIds.forEach(function(sid){
+      var b=(srcCache&&srcCache.sources&&srcCache.sources[sid])||{};
+      var bad=b.stale||b.ok===false, act=sid===activeSrc;
+      h+='<span data-src="'+esc(sid)+'" style="cursor:pointer;font-size:11px;border-radius:99px;border:1px solid var(--border,rgba(0,0,0,0.1));padding:3px 10px;'
+        +(act?'background:var(--primary,#111);color:var(--primary-foreground,#fff);border-color:transparent;font-weight:600;':'opacity:'+(bad?'0.45':'0.75'))
+        +'">'+esc(sourceName(sid))+(bad?' ⚠':'')+'</span>';
+    });
+    return h+'</div>';
+  }
+  function bindTabs(){
+    if(!popup) return;
+    Array.from(popup.querySelectorAll("[data-prov]")).forEach(function(s){
+      s.addEventListener("click", function(e){ e.stopPropagation(); try{ localStorage.setItem(LS_PROVIDER, s.getAttribute("data-prov")); }catch(e2){} renderPopup(); });
+    });
+    Array.from(popup.querySelectorAll("[data-src]")).forEach(function(s){
+      s.addEventListener("click", function(e){ e.stopPropagation(); try{ localStorage.setItem(LS_PROVIDER, "src:"+s.getAttribute("data-src")); }catch(e2){} renderPopup(); });
+    });
+  }
+  function srcFooterHtml(){
+    var t=S(), age=srcAgeMin(), ageTxt="";
+    try{
+      if(srcCache&&srcCache._fetchedAt){ var d=new Date(Date.parse(srcCache._fetchedAt)); ageTxt=pad(d.getHours())+":"+pad(d.getMinutes()); }
+    }catch(e){}
+    if(age!=null&&age>3) ageTxt+=(ageTxt?" · ":"")+t.stale(age);
+    return '<div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--muted-foreground,#71717a)">'
+      +'<span style="flex:1"></span>'
+      +'<span data-act="refresh" title="'+t.refresh+'" style="cursor:pointer;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;line-height:1">↻</span>'
+      +'<span>'+ageTxt+'</span></div>';
+  }
+  function sourcePanelHtml(sid){
+    var t=S();
+    var b=(srcCache&&srcCache.sources&&srcCache.sources[sid])||null;
+    if(!b) return '<div style="opacity:.6">'+t.noData+'</div>';
+    var h='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-weight:650">'+esc(sourceName(sid))+'</span>'
+      +(b.stale?('<span style="color:#eab308;font-size:11px">'+esc(t.srcStale)+'</span>'):'')+'</div>';
+    if(b.error) h+='<div style="color:#f87171;font-size:11px;margin-bottom:6px">'+esc(String(b.error))+'</div>';
+    var sect='border-top:1px solid var(--border,rgba(0,0,0,0.06));margin-top:6px;padding-top:6px;font-size:11px';
+    if(sid==="cc-switch"){
+      var tt=b.totals||{}, td=tt.today||{}, hr=tt.hour||{}, mo=tt.month||{};
+      h+=statRowHtml([
+        [t.statToday, td.requests+" "+t.reqUnit+" · "+td.errors+" "+t.errUnit+" ("+Math.round((td.errorRate||0)*100)+"%)"],
+        [t.statCost, fmtMoney(td.cost,"USD")+" · "+t.monthWord+" "+fmtMoney(mo.cost,"USD")],
+        [t.statHour, hr.requests+" "+t.reqUnit+" · "+hr.errors+" "+t.errUnit]
+      ]);
+      (b.limits||[]).forEach(function(l){
+        h+=rowHtml(l.window==="daily"?t.limitDaily:t.limitMonthly,
+          {kind:"budget", value:l.value, limit:l.limit, unit:l.unit});
+      });
+      if((b.health||[]).length){
+        h+='<div style="'+sect+'">';
+        b.health.forEach(function(x){
+          var c=x.healthy===false?"#ef4444":((x.consecutiveFailures||0)>0?"#eab308":"#22c55e");
+          h+='<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0">'
+            +'<span style="display:inline-block;width:6px;height:6px;border-radius:99px;background:'+c+';flex-shrink:0"></span>'
+            +'<span>'+esc(x.name)+' <span style="opacity:.5">'+esc(x.app)+'</span></span>'
+            +'<span style="flex:1"></span>'
+            +'<span style="opacity:.6;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(x.lastError||"")+'">'+esc((x.lastError||"").slice(0,60))+'</span></div>';
+        });
+        h+='</div>';
+      }
+      if((b.models||[]).length){
+        h+='<div style="'+sect+'"><div style="opacity:.55;margin-bottom:2px">'+t.perModel+'</div>';
+        b.models.slice(0,5).forEach(function(m){
+          h+='<div style="display:flex;gap:8px;padding:1px 0"><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(m.model)+'</span>'
+            +'<span style="flex:1"></span><span style="opacity:.8">'+esc(fmtMoney(m.cost,"USD"))+'</span>'
+            +'<span style="opacity:.5;min-width:56px;text-align:right">'+m.requests+' '+esc(t.reqUnit)+'</span>'
+            +(m.errors?('<span style="color:#f87171;min-width:46px;text-align:right">'+m.errors+' '+esc(t.errUnit)+'</span>'):'')+'</div>';
+        });
+        h+='</div>';
+      }
+    } else if(sid==="codeg-usage"){
+      var ty=(b.totals||{}).today||{}, d30=(b.totals||{}).d30||{};
+      h+=statRowHtml([
+        [t.statToday, fmtTokens(ty.totalTokens)+" · "+ty.turns+" "+t.turnUnit],
+        [t.stat30d, fmtTokens(d30.totalTokens)+" · "+d30.turns+" "+t.turnUnit],
+        [t.statCache, fmtTokens(ty.cacheReadTokens)]
+      ]);
+      if((b.byModel||[]).length){
+        h+='<div style="'+sect+'"><div style="opacity:.55;margin-bottom:2px">'+t.perModel+'</div>';
+        b.byModel.slice(0,6).forEach(function(m){
+          h+='<div style="display:flex;gap:8px;padding:1px 0"><span style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(m.key)+'</span>'
+            +'<span style="flex:1"></span><span style="opacity:.75">'+fmtTokens(m.tokens)+'</span>'
+            +'<span style="opacity:.5;min-width:44px;text-align:right">'+m.turns+' '+esc(t.turnUnit)+'</span></div>';
+        });
+        h+='</div>';
+      }
+      if((b.byAgent||[]).length){
+        h+='<div style="'+sect+'"><div style="opacity:.55;margin-bottom:2px">'+t.perAgent+'</div>';
+        b.byAgent.slice(0,5).forEach(function(a){
+          h+='<div style="display:flex;gap:8px;padding:1px 0"><span style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.key)+'</span>'
+            +'<span style="flex:1"></span><span style="opacity:.75">'+fmtTokens(a.tokens)+'</span>'
+            +'<span style="opacity:.5;min-width:44px;text-align:right">'+a.turns+' '+esc(t.turnUnit)+'</span></div>';
+        });
+        h+='</div>';
+      }
+    }
+    return h;
+  }
+  function collectSourceAlerts(){
+    var out=[];
+    try{
+      var t=S();
+      var b=srcCache&&srcCache.sources&&srcCache.sources["cc-switch"];
+      if(b&&!b.stale){
+        var hourKey=Math.floor(Date.now()/3600000);
+        (b.health||[]).forEach(function(x){
+          if(x.healthy===false){
+            out.push({key:"h:cc-switch:"+x.providerId+":"+x.app+":"+hourKey, kind:"health",
+                      name:x.name||"", provider:x.app, lastError:(x.lastError||"").slice(0,80)});
+          }
+        });
+        var hr=b.totals&&b.totals.hour;
+        if(hr&&hr.requests>=10&&hr.errorRate>0.2){
+          out.push({key:"h:cc-switch:rate:"+hourKey, kind:"health", name:"cc-switch",
+                    provider:"", lastError:t.errRate(Math.round(hr.errorRate*100))});
+        }
+        (b.limits||[]).forEach(function(l){
+          if(l.limit>0){
+            var pct=l.value/l.limit*100;
+            [80,100].forEach(function(th){
+              if(pct>=th) out.push({key:"s:cc-switch:"+l.providerId+":"+l.app+":"+l.window+":"+th,
+                kind:"limit", name:l.name||"", provider:l.app,
+                win:(l.window==="daily"?t.limitDaily:t.limitMonthly), pct:Math.round(pct)});
+            });
+          }
+        });
+      }
+    }catch(e){}
+    return out;
+  }
+
   function renderPopup(){
     if(!popup || !cache) return;
     var t=S();
+    // 本地数据源视图（tab 前缀 src:）
+    var srcIds=sourceTabs();
+    var tabNow="";
+    try{ tabNow=localStorage.getItem(LS_PROVIDER)||""; }catch(e0){}
+    var activeSrc=(tabNow.indexOf("src:")===0&&srcIds.indexOf(tabNow.slice(4))>=0)?tabNow.slice(4):null;
+    if(activeSrc){
+      popup.innerHTML=tabBarHtml(providerList(cache), srcIds, null, activeSrc)
+        +sourcePanelHtml(activeSrc)+srcFooterHtml();
+      bindTabs();
+      var rf0=popup.querySelector('[data-act="refresh"]');
+      if(rf0) rf0.addEventListener("click", function(e){ e.stopPropagation(); refresh(); });
+      return;
+    }
     // 先保住表单状态：自动刷新重建 DOM 时不吃掉正在输入的字
     var keepForm=null;
     try{
@@ -488,16 +696,9 @@
     var mode=getMode();
     var html="";
     var addBtnHtml='<span data-act="add-form" title="'+t.addKey+'" style="cursor:pointer;font-size:14px;line-height:1;opacity:.6;border:1px solid var(--border,rgba(0,0,0,0.1));border-radius:99px;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center">＋</span>';
-    // provider Tab（多供应商时）
-    if(providers.length>1){
-      html+='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
-      providers.forEach(function(p){
-        var act=p===activeP, bad=!accountsOf(cache,p).some(hasData);
-        html+='<span data-prov="'+esc(p)+'" style="cursor:pointer;font-size:11px;border-radius:99px;border:1px solid var(--border,rgba(0,0,0,0.1));padding:3px 10px;'
-          +(act?'background:var(--primary,#111);color:var(--primary-foreground,#fff);border-color:transparent;font-weight:600;':'opacity:'+(bad?'0.4':'0.75'))
-          +'">'+esc(providerName(p))+'</span>';
-      });
-      html+='</div>';
+    // provider Tab + 本地数据源 Tab
+    if(providers.length+sourceTabs().length>1){
+      html+=tabBarHtml(providers, sourceTabs(), activeP, null);
     }
     // 账号 Tab（当前 provider 下 >1 个时）
     if(list.length>1){
@@ -533,6 +734,7 @@
     else{
       ws.forEach(function(w){ if(w.kind!=="count") html+=rowHtml(L(w.label), w); });
       html+=sparkHtml(acct);
+      if(acct.stale) html+='<div style="color:#eab308;font-size:11px;margin-top:4px">'+esc(t.acctStale+(acct.error?("："+acct.error):""))+'</div>';
     }
     // 右下角平时只显示抓取时刻 HH:MM；数据过期（>3 分钟）才标 stale
     var age=dataAgeMin();
@@ -567,9 +769,7 @@
     Array.from(popup.querySelectorAll("[data-acct]")).forEach(function(s){
       s.addEventListener("click", function(e){ e.stopPropagation(); setAcctSel(activeP, s.getAttribute("data-acct")); render(cache); });
     });
-    Array.from(popup.querySelectorAll("[data-prov]")).forEach(function(s){
-      s.addEventListener("click", function(e){ e.stopPropagation(); try{ localStorage.setItem(LS_PROVIDER, s.getAttribute("data-prov")); }catch(e2){} renderPopup(); });
-    });
+    bindTabs();
     var tm=popup.querySelector('[data-act="toggle-mode"]');
     if(tm) tm.addEventListener("click", function(e){ e.stopPropagation(); localStorage.setItem(LS_MODE, getMode()==="used"?"left":"used"); render(cache); });
     var rf=popup.querySelector('[data-act="refresh"]');
@@ -644,9 +844,16 @@
       histCache=out.slice(-1500);
     }catch(e){}
   }
+  async function fetchSources(){
+    try{
+      var r=await fetch(SRC_URL+"?t="+Date.now(),{cache:"no-store"});
+      if(!r.ok) return;
+      srcCache=await r.json();
+    }catch(e){}
+  }
   async function fetchDirect(){ var k=localStorage.getItem("opencode-go-api-key"); if(!k) throw new Error("no key"); var r=await fetch(API_URL,{headers:{Authorization:"Bearer "+k}}); if(!r.ok) throw new Error("api"); return await r.json(); }
   async function refresh(){
-    try{ var d=await fetchLocal(); cache=d; render(d); if(popup&&popup.style.display!=="none"){ await fetchHist(); renderPopup(); } return;}catch(e){}
+    try{ var d=await fetchLocal(); cache=d; await fetchSources(); render(d); if(popup&&popup.style.display!=="none"){ await fetchHist(); renderPopup(); } return;}catch(e){}
     try{ var d2=await fetchDirect(); cache=d2; render(d2); if(popup&&popup.style.display!=="none")renderPopup();}catch(e2){ var inner=document.getElementById("oq-inline"); if(inner&&!cache) inner.textContent="—"; }
   }
   function ensureTimer(){ if(!timerStarted){ timerStarted=true; refresh(); setInterval(refresh, REFRESH_MS); } }
